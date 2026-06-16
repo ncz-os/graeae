@@ -5,7 +5,11 @@
 """
 
 import hashlib
+import hmac
 import logging
+import os
+import time
+from collections import defaultdict, deque
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -27,7 +31,137 @@ from mnemos.domain.models import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["consultations"])
 
-_GENESIS_HASH = hashlib.sha256(b"MNEMOS_AUDIT_GENESIS_v3").hexdigest()
+# ── Audit-chain signing (review #10/#11) ──────────────────────────────────────
+# Canonical, single-source-of-truth chain math for the GRAEAE audit log.
+#
+# #10 — the chain was a BARE SHA-256 over a PUBLIC genesis constant. Any actor
+#       with DB write access could recompute every chain_hash from public
+#       inputs, and verify() re-derived them identically, so tampering was
+#       undetectable. We now sign each link with HMAC-SHA256 under a server-held
+#       secret; a DB-only attacker can no longer forge valid links.
+# #11 — the chain covered only prev+prompt_hash+response_hash, so metadata
+#       (provider / task_type / quality_score / consultation_id) could be
+#       rewritten and the chain still verified, and a sequence_num was never
+#       bound so trailing rows could be truncated undetected. We now bind all
+#       of that metadata (and the sequence_num) into the MAC.
+#
+# ROLLOUT NOTE: the LIVE write path is mnemos-core's
+# `backend.consultations.create_consultation_with_audit`, which must import and
+# use `compute_audit_chain_hash` / `audit_genesis_hash` below, and a one-time
+# re-anchor migration must re-sign existing rows. Full tail-truncation defense
+# additionally needs a signed tip-anchor row (schema follow-up in core).
+_AUDIT_GENESIS_LABEL = b"MNEMOS_AUDIT_GENESIS_v3"
+_FIELD_SEP = "\x1f"
+
+
+def _audit_hmac_key() -> bytes:
+    """Return the server-held audit signing key, or fail closed.
+
+    Fail-closed (review theme #3): we refuse to read or write an UNSIGNED audit
+    chain. If the key is unset the audit endpoints return 503 rather than
+    silently degrading to a forgeable bare hash.
+    """
+    key = os.environ.get("MNEMOS_GRAEAE_AUDIT_HMAC_KEY", "").strip()
+    if not key:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "audit chain signing key (MNEMOS_GRAEAE_AUDIT_HMAC_KEY) is not "
+                "configured; refusing to operate an unsigned audit chain"
+            ),
+        )
+    return key.encode()
+
+
+def audit_genesis_hash() -> str:
+    """Keyed genesis so the chain root cannot be reproduced without the key."""
+    return hmac.new(_audit_hmac_key(), _AUDIT_GENESIS_LABEL, hashlib.sha256).hexdigest()
+
+
+def compute_audit_chain_hash(
+    *,
+    prev_chain_hash: str,
+    prompt_hash: str,
+    response_hash: str,
+    sequence_num: object = None,
+    consultation_id: object = None,
+    task_type: object = None,
+    provider: object = None,
+    quality_score: object = None,
+) -> str:
+    """HMAC each link over the full, ordered metadata tuple (review #10/#11)."""
+    payload = _FIELD_SEP.join(
+        [
+            prev_chain_hash or "",
+            "" if sequence_num is None else str(sequence_num),
+            "" if consultation_id is None else str(consultation_id),
+            "" if task_type is None else str(task_type),
+            "" if provider is None else str(provider),
+            "" if quality_score is None else f"{float(quality_score):.6f}",
+            prompt_hash or "",
+            response_hash or "",
+        ]
+    )
+    return hmac.new(_audit_hmac_key(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+# ── Per-principal consultation quota (review #12) ─────────────────────────────
+# The only throttle was @limiter.limit("60/minute"); a single principal could
+# still fire 60 mode=all / mode=debate consultations per minute, each fanning
+# out to every muse — a financial DoS. Enforce a server-side, per-USER,
+# cost-WEIGHTED sliding-window quota so expensive modes drain budget faster.
+_MODE_COST_WEIGHT = {
+    "single": 1.0,
+    "local": 1.0,
+    "auto": 2.0,
+    "external": 3.0,
+    "majority": 3.0,
+    "all": 5.0,
+    "debate": 8.0,
+}
+_QUOTA_WINDOW_SECONDS = 60.0
+# user_id -> deque[(monotonic_ts, weight)]. Bounded by active principals;
+# empty buckets are pruned opportunistically below.
+_consult_usage: dict[str, deque] = defaultdict(deque)
+
+
+def _consult_quota_per_min() -> float:
+    try:
+        return float(os.environ.get("MNEMOS_GRAEAE_CONSULT_QUOTA_PER_MIN", "20"))
+    except ValueError:
+        return 20.0
+
+
+def _enforce_consult_quota(user_id: str, mode: str) -> None:
+    """Cost-weighted per-principal quota. Raises 429 when the window is full.
+
+    Synchronous (no awaits) so the read-modify-write of the bucket is atomic
+    within the event loop; keying is the SERVER-derived user_id, never a
+    client-supplied value.
+    """
+    quota = _consult_quota_per_min()
+    if quota <= 0:
+        return
+    weight = _MODE_COST_WEIGHT.get((mode or "auto").lower(), 2.0)
+    now = time.monotonic()
+    cutoff = now - _QUOTA_WINDOW_SECONDS
+    bucket = _consult_usage[str(user_id or "anonymous")]
+    while bucket and bucket[0][0] < cutoff:
+        bucket.popleft()
+    used = sum(w for _, w in bucket)
+    if used + weight > quota:
+        retry = max(1, int(bucket[0][0] + _QUOTA_WINDOW_SECONDS - now)) if bucket else int(_QUOTA_WINDOW_SECONDS)
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"GRAEAE consultation quota exceeded for this principal "
+                f"({used:.0f}+{weight:.0f} > {quota:.0f} cost-units/min)"
+            ),
+            headers={"Retry-After": str(retry)},
+        )
+    bucket.append((now, weight))
+    if not bucket:  # pragma: no cover - defensive prune
+        _consult_usage.pop(str(user_id or "anonymous"), None)
 
 
 def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
@@ -206,18 +340,32 @@ async def _write_audit_entry_on_conn(
     # Audit-chain continuity is internal tamper-evidence, not a
     # user-content read path: the chain tip must include soft-deleted
     # rows so later writes keep validating across GDPR restore windows.
-    prev_row = await conn.fetchrow("SELECT id, chain_hash FROM graeae_audit_log " "ORDER BY sequence_num DESC LIMIT 1")
+    prev_row = await conn.fetchrow(
+        "SELECT id, chain_hash, sequence_num FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT 1"
+    )
     if prev_row:
         prev_chain = prev_row["chain_hash"]
         prev_id = prev_row["id"]
+        sequence_num = int(prev_row["sequence_num"]) + 1
     else:
-        prev_chain = _GENESIS_HASH
+        prev_chain = audit_genesis_hash()
         prev_id = None
+        sequence_num = 1
 
-    # Chain covers prev_chain + prompt_hash + response_hash so that
-    # neither the prompt nor the response can be swapped without
-    # breaking chain integrity.
-    chain_hash = hashlib.sha256((prev_chain + prompt_hash + response_hash).encode()).hexdigest()
+    # SECURITY (review #10/#11): keyed MAC over prev + the full metadata tuple
+    # (sequence_num/consultation_id/task_type/provider/quality_score) plus the
+    # prompt/response hashes — see compute_audit_chain_hash. The advisory lock
+    # above guarantees sequence_num = prev + 1 is the value this row will land.
+    chain_hash = compute_audit_chain_hash(
+        prev_chain_hash=prev_chain,
+        prompt_hash=prompt_hash,
+        response_hash=response_hash,
+        sequence_num=sequence_num,
+        consultation_id=consultation_id,
+        task_type=task_type,
+        provider=provider,
+        quality_score=quality_score,
+    )
 
     await conn.execute(
         "INSERT INTO graeae_audit_log "
@@ -300,6 +448,10 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
     logger.info(
         f"[CONSULTATION] {user.user_id}: {body.task_type} " f"(limit_chars={body.limit_chars}, format={body.format})"
     )
+    # SECURITY (review #12): cost-weighted per-principal quota, BEFORE any
+    # provider fan-out, so a single caller cannot turn 60 req/min of
+    # mode=all/debate into a financial DoS.
+    _enforce_consult_quota(user.user_id, body.mode)
     try:
         backend = require_consultations_backend()
         from mnemos.domain.graeae.engine import get_graeae_engine
@@ -382,7 +534,11 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                         owner_id=user.user_id,
                         namespace=user.namespace,
                         memory_ids=memory_ids,
-                        genesis_hash=_GENESIS_HASH,
+                        # SECURITY (review #10): keyed genesis. NOTE: mnemos-core's
+                        # create_consultation_with_audit must adopt
+                        # compute_audit_chain_hash for the per-link MAC too, else
+                        # verify() below will (correctly) report the chain unsigned.
+                        genesis_hash=audit_genesis_hash(),
                     )
                     if backend.supports_webhooks:
                         delivery_ids = await backend.webhooks.dispatch_event(
@@ -539,10 +695,19 @@ async def verify_audit_chain(
         )
 
     if verify_global_chain:
-        prev_chain = _GENESIS_HASH
+        prev_chain = audit_genesis_hash()
         failures: dict[int, str] = {}
         for row in rows:
-            expected = hashlib.sha256((prev_chain + row["prompt_hash"] + row["response_hash"]).encode()).hexdigest()
+            expected = compute_audit_chain_hash(
+                prev_chain_hash=prev_chain,
+                prompt_hash=row["prompt_hash"],
+                response_hash=row["response_hash"],
+                sequence_num=row.get("sequence_num"),
+                consultation_id=row.get("consultation_id"),
+                task_type=row.get("task_type"),
+                provider=row.get("provider"),
+                quality_score=row.get("quality_score"),
+            )
             if expected != row["chain_hash"]:
                 failures.setdefault(
                     row["sequence_num"],
@@ -575,7 +740,7 @@ async def verify_audit_chain(
     for row in rows:
         scoped_sequence_num = row["scoped_sequence_num"]
         stored_prev_chain = row["prev_chain_hash"]
-        prev_chain = row["expected_prev_hash"] or _GENESIS_HASH
+        prev_chain = row["expected_prev_hash"] or audit_genesis_hash()
         if stored_prev_chain and stored_prev_chain != prev_chain:
             logger.warning(
                 "Scoped audit predecessor mismatch for user=%s scoped_row=%s "
@@ -591,7 +756,16 @@ async def verify_audit_chain(
                 f"Scoped chain broken at row {scoped_sequence_num}: "
                 "stored previous hash does not match actual previous row",
             )
-        expected = hashlib.sha256((prev_chain + row["prompt_hash"] + row["response_hash"]).encode()).hexdigest()
+        expected = compute_audit_chain_hash(
+            prev_chain_hash=prev_chain,
+            prompt_hash=row["prompt_hash"],
+            response_hash=row["response_hash"],
+            sequence_num=row.get("sequence_num"),
+            consultation_id=row.get("consultation_id"),
+            task_type=row.get("task_type"),
+            provider=row.get("provider"),
+            quality_score=row.get("quality_score"),
+        )
         if expected != row["chain_hash"]:
             logger.warning(
                 "Scoped audit hash mismatch for user=%s scoped_row=%s "
