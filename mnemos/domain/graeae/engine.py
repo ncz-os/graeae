@@ -50,7 +50,7 @@ from mnemos.core.resilience import (
     make_concurrency_limiter,
     make_rate_limiter_pool,
 )
-from mnemos.domain.graeae.api_keys import _PROVIDER_ENV_VARS, get_key
+from mnemos.domain.providers import _PROVIDER_ENV_VARS, get_key
 
 
 def _env_var_hint(key_name: str) -> str:
