@@ -140,6 +140,10 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
         # 2026-05-28 snapshot; supersedes 5.2-chat-latest.
         "model": "gpt-5.5", "weight": 0.88, "api": "openai", "key_name": "openai",
     },
+    "chatgpt_pro": {
+        "url": "oauth+codex://",
+        "model": "gpt-5.5", "weight": 0.88, "api": "chatgpt_pro", "key_name": "chatgpt_pro", "codex_bin": "/usr/local/bin/codex",
+    },
     "claude": {
         "url": "https://api.anthropic.com/v1/messages",
         # iter 56 operator override: keep opus-4-6 for quality. Early-return
@@ -1250,7 +1254,20 @@ class GraeaeEngine:
                             f"models/{model}:generateContent"
                         )
 
-                if provider_cfg.get("api") == "openai":
+                # ChatGPT Pro OAuth dispatch (codex CLI subprocess; OAuth tokens at
+                # ~/.codex/auth.json). No API key; flat-rate subscription. Operator
+                # policy: OpenAI-family consults route via the OAuth CLI, not HTTP keys.
+                if provider_cfg.get("api") == "chatgpt_pro":
+                    async for chunk in self._stream_chatgpt_pro_oauth(
+                        provider_cfg,
+                        prompt,
+                        timeout,
+                        generation_params=generation_params,
+                        request_params=request_params,
+                        messages=messages,
+                    ):
+                        yield chunk
+                elif provider_cfg.get("api") == "openai":
                     async for chunk in self._stream_openai_compatible(
                         provider_cfg,
                         prompt,
@@ -1421,6 +1438,76 @@ class GraeaeEngine:
             "model_id": provider["model"],
             "choices": normalized_choices,
         }
+
+    async def _stream_chatgpt_pro_oauth(
+        self,
+        provider_cfg: dict,
+        prompt: str,
+        timeout: int,
+        generation_params: Optional[Dict[str, Any]] = None,
+        request_params: Optional[Dict[str, Any]] = None,
+        messages: Optional[list[dict]] = None,
+    ):
+        """ChatGPT Pro via codex CLI subprocess (OAuth tokens at ~/.codex/auth.json).
+
+        Yields OpenAI-compat content chunks. No API key is used; the codex CLI
+        authenticates with the operator ChatGPT Pro subscription. Operator policy:
+        OpenAI-family consults route through this OAuth CLI path.
+        """
+        import asyncio
+        codex_bin = provider_cfg.get("codex_bin") or "/usr/local/bin/codex"
+
+        if messages:
+            user_msgs = [m for m in messages if (m.get("role") in ("user", "system"))]
+            if user_msgs:
+                prompt = "\n\n".join((m.get("content") or "") for m in user_msgs)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                codex_bin, "exec", "--skip-git-repo-check",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (OSError, ValueError) as exc:
+            # codex CLI not present/executable (e.g. not installed in this
+            # deployment): degrade gracefully so this muse fails and the rest
+            # of the consult proceeds, rather than crashing the request.
+            raise ProviderStreamError(
+                f"chatgpt_pro: cannot launch codex CLI ({codex_bin!r}): {exc}"
+            ) from exc
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(input=prompt.encode("utf-8")), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            raise ProviderStreamError(f"chatgpt_pro: codex exec timeout after {timeout}s")
+        finally:
+            # Guarantee the child is reaped on every exit path - timeout,
+            # BrokenPipeError, or CancelledError (the consult loop cancels
+            # slower muses once quorum is reached) - so no codex zombie leaks.
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+        if proc.returncode != 0:
+            raise ProviderStreamError(
+                f"chatgpt_pro: codex exec rc={proc.returncode}: "
+                f"{(stderr_b or b'').decode(errors='replace')[:300]}"
+            )
+        out = stdout_b.decode("utf-8", errors="replace")
+        content = out
+        idx = out.find("\ncodex\n")
+        if idx >= 0:
+            tail = out[idx + len("\ncodex\n"):]
+            tu = tail.find("\ntokens used\n")
+            content = tail[:tu].strip() if tu >= 0 else tail.strip()
+        if not content:
+            raise ProviderStreamError("chatgpt_pro: empty response from codex")
+        yield {"role": "assistant"}
+        yield {"index": 0, "content": content}
 
     async def _stream_openai_compatible(
         self,
