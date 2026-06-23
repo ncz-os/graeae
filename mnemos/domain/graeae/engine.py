@@ -209,6 +209,49 @@ def _load_providers() -> dict[str, dict]:
     return providers
 
 
+def _provider_scope(cfg: dict) -> str:
+    """Classify a provider as ``"local"`` or ``"external"``.
+
+    This is what makes ``consult(mode="local"|"external")`` an actual
+    provider-*scope* filter rather than a mere quorum label. Resolution
+    order:
+
+      1. An explicit ``scope`` (or legacy ``location``) field on the
+         provider config — ``"local"`` / ``"external"`` — always wins.
+         This is REQUIRED for providers whose URL host does not reflect
+         their true scope: e.g. an OpenAI/Anthropic muse reached through
+         a loopback OAuth shim (``http://127.0.0.1:5079/...``) is an
+         *external* model and must declare ``scope = "external"``, since
+         host inference would otherwise call it local.
+      2. Otherwise infer from the URL host: loopback / RFC-1918-private /
+         link-local IPs, ``localhost``, ``*.local|*.lan|*.internal``, and
+         bare (dotless) hostnames are ``"local"`` (LAN GPU servers);
+         public FQDNs are ``"external"``.
+
+    Unknown / unparseable hosts default to ``"external"`` — fail-open to
+    the cloud panel rather than silently routing an external-only
+    consult at an unverified endpoint.
+    """
+    explicit = str(cfg.get("scope") or cfg.get("location") or "").strip().lower()
+    if explicit in {"local", "external"}:
+        return explicit
+
+    from urllib.parse import urlparse
+    import ipaddress
+
+    host = (urlparse(str(cfg.get("url", ""))).hostname or "").lower()
+    if not host:
+        return "external"
+    if host == "localhost" or host.endswith((".local", ".lan", ".internal")):
+        return "local"
+    try:
+        ip = ipaddress.ip_address(host)
+        return "local" if (ip.is_private or ip.is_loopback or ip.is_link_local) else "external"
+    except ValueError:
+        # Bare hostname (no dots) => LAN box; dotted FQDN => public cloud.
+        return "local" if "." not in host else "external"
+
+
 def _content_text(content: Any) -> str:
     if content is None:
         return ""
@@ -679,6 +722,31 @@ class GraeaeEngine:
             candidate_providers = [p for p in selection if p in self.providers]
         else:
             candidate_providers = list(self.providers)
+            # ── Scope filter ─────────────────────────────────────────────
+            # `local` / `external` are provider-SCOPE filters, not just
+            # quorum labels: restrict the lineup to muses whose endpoint
+            # matches the requested scope. `auto` / `all` keep every
+            # registered muse. (A Custom Query `selection` is honored
+            # verbatim and is not scope-filtered.)
+            if mode in {"local", "external"}:
+                candidate_providers = [
+                    p for p in candidate_providers
+                    if _provider_scope(self.providers[p]) == mode
+                ]
+                logger.info(
+                    "[GRAEAE] mode=%s scope filter -> %d/%d providers: %s",
+                    mode, len(candidate_providers), len(self.providers),
+                    candidate_providers,
+                )
+                if not candidate_providers:
+                    logger.error(
+                        "[GRAEAE] mode=%s selected zero providers "
+                        "(no muse classified as %s)", mode, mode,
+                    )
+                    return {
+                        "all_responses": {},
+                        "error": f"no {mode} providers configured",
+                    }
 
         # ── Eligibility gate ─────────────────────────────────────────────────
         # A provider is skipped (not queued) if it is:

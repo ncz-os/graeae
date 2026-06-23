@@ -61,17 +61,29 @@ class _FakeQuality:
         return {}
 
 
-def _provider_config(model: str, weight: float) -> dict:
-    return {
-        "url": "https://example.invalid/v1/chat/completions",
+def _provider_config(
+    model: str,
+    weight: float,
+    url: str = "https://example.invalid/v1/chat/completions",
+    scope: str | None = None,
+) -> dict:
+    cfg = {
+        "url": url,
         "model": model,
         "weight": weight,
         "api": "openai",
         "key_name": model,
     }
+    if scope is not None:
+        cfg["scope"] = scope
+    return cfg
 
 
-def _build_engine(monkeypatch, responses: dict[str, str] | Callable[[str, str], str] | None = None):
+def _build_engine(
+    monkeypatch,
+    responses: dict[str, str] | Callable[[str, str], str] | None = None,
+    providers: dict[str, dict] | None = None,
+):
     import mnemos.core.lifecycle as lc
     import mnemos.domain.graeae.engine as graeae_engine
     from mnemos.domain.graeae.engine import GraeaeEngine
@@ -79,7 +91,7 @@ def _build_engine(monkeypatch, responses: dict[str, str] | Callable[[str, str], 
     monkeypatch.setattr(lc, "_pool", None)
     monkeypatch.setattr(graeae_engine, "get_elo_weights", lambda force_refresh=False: None)
     engine = GraeaeEngine()
-    engine.providers = {
+    engine.providers = providers if providers is not None else {
         "alpha": _provider_config("alpha-model", 0.95),
         "beta": _provider_config("beta-model", 0.85),
         "gamma": _provider_config("gamma-model", 0.75),
@@ -313,3 +325,94 @@ async def test_majority_mode_reports_quorum_not_reached(monkeypatch):
 
     assert result["quorum_reached"] is False
     assert result["consensus_score"] < result["quorum_threshold"]
+
+
+# ── Scope filter: mode=local|external actually narrows the muse lineup ────────
+# Regression for the defect where `mode` was only a quorum label, so an
+# `external` consult still queried local-GPU muses (and vice versa).
+
+def _scoped_providers() -> dict[str, dict]:
+    return {
+        # public cloud FQDNs -> external by host inference
+        "cloud_openai": _provider_config(
+            "gpt", 0.90, url="https://api.openai.com/v1/chat/completions"),
+        "cloud_xai": _provider_config(
+            "grok", 0.86, url="https://api.x.ai/v1/chat/completions"),
+        # LAN GPU servers (RFC-1918) -> local by host inference
+        "lan_cerberus": _provider_config(
+            "gemma", 0.70, url="http://192.168.207.96:8080/v1/chat/completions"),
+        "lan_hydra": _provider_config(
+            "qwen", 0.72, url="http://192.168.207.78:8080/v1/chat/completions"),
+        # OAuth shim on loopback, but proxies a CLOUD model -> explicit scope wins
+        "shim_openai": _provider_config(
+            "gpt-oauth", 0.88,
+            url="http://127.0.0.1:5079/openai/v1/chat/completions",
+            scope="external"),
+    }
+
+
+def test_provider_scope_classification():
+    from mnemos.domain.graeae.engine import _provider_scope
+
+    p = _scoped_providers()
+    assert _provider_scope(p["cloud_openai"]) == "external"
+    assert _provider_scope(p["cloud_xai"]) == "external"
+    assert _provider_scope(p["lan_cerberus"]) == "local"
+    assert _provider_scope(p["lan_hydra"]) == "local"
+    # explicit scope overrides the loopback-host inference
+    assert _provider_scope(p["shim_openai"]) == "external"
+    # bare hostname -> local; localhost -> local; unparseable -> external
+    assert _provider_scope({"url": "http://cerberus:8080/v1"}) == "local"
+    assert _provider_scope({"url": "http://localhost:5079/x"}) == "local"
+    assert _provider_scope({"url": ""}) == "external"
+
+
+@pytest.mark.asyncio
+async def test_external_mode_queries_only_external_muses(monkeypatch):
+    engine, calls = _build_engine(monkeypatch, providers=_scoped_providers())
+
+    result = await engine.consult("frontier only", "reasoning", mode="external")
+
+    queried = {call["provider"] for call in calls}
+    assert queried == {"cloud_openai", "cloud_xai", "shim_openai"}
+    assert set(result["all_responses"]) == {"cloud_openai", "cloud_xai", "shim_openai"}
+    assert "lan_cerberus" not in result["all_responses"]
+    assert "lan_hydra" not in result["all_responses"]
+
+
+@pytest.mark.asyncio
+async def test_local_mode_queries_only_local_muses(monkeypatch):
+    engine, calls = _build_engine(monkeypatch, providers=_scoped_providers())
+
+    result = await engine.consult("on-prem only", "reasoning", mode="local")
+
+    queried = {call["provider"] for call in calls}
+    assert queried == {"lan_cerberus", "lan_hydra"}
+    assert set(result["all_responses"]) == {"lan_cerberus", "lan_hydra"}
+
+
+@pytest.mark.asyncio
+async def test_all_mode_queries_every_muse_regardless_of_scope(monkeypatch):
+    engine, _calls = _build_engine(monkeypatch, providers=_scoped_providers())
+
+    result = await engine.consult("everyone", "reasoning", mode="all")
+
+    # `all` keeps the full lineup; cancelled muses still appear as keys.
+    assert set(result["all_responses"]) == set(_scoped_providers())
+
+
+@pytest.mark.asyncio
+async def test_external_mode_with_no_external_muses_errors(monkeypatch):
+    local_only = {
+        "lan_cerberus": _provider_config(
+            "gemma", 0.70, url="http://192.168.207.96:8080/v1/chat/completions"),
+        "lan_hydra": _provider_config(
+            "qwen", 0.72, url="http://192.168.207.78:8080/v1/chat/completions"),
+    }
+    engine, calls = _build_engine(monkeypatch, providers=local_only)
+
+    result = await engine.consult("frontier only", "reasoning", mode="external")
+
+    assert calls == []
+    assert result["all_responses"] == {}
+    assert "no external providers" in result["error"]
