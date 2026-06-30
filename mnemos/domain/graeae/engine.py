@@ -172,6 +172,20 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
 }
 
 
+def _builtin_fallback() -> dict[str, dict]:
+    """Built-in provider defaults, each tagged ``_source="builtin"``.
+
+    The tag marks these as baked-in fallbacks rather than operator-supplied
+    config. Consumers such as the PANTHEON gateway use it to refuse a builtin
+    vendor URL as an idempotent *connection* endpoint (a mass-distribution image
+    must resolve its endpoint from runtime config, not a baked default); GRAEAE's
+    own consensus path still uses the URLs to call muses. Providers loaded from
+    config.toml are intentionally left untagged — absence of the tag means
+    operator-configured.
+    """
+    return {name: {**dict(cfg), "_source": "builtin"} for name, cfg in _BUILTIN_PROVIDERS.items()}
+
+
 def _load_providers() -> dict[str, dict]:
     """Load provider registry from config.toml [graeae.providers].
 
@@ -187,7 +201,7 @@ def _load_providers() -> dict[str, dict]:
 
     if not registry:
         logger.debug("[GRAEAE] no providers in config.toml — using built-in defaults")
-        return {k: dict(v) for k, v in _BUILTIN_PROVIDERS.items()}
+        return _builtin_fallback()
 
     providers: dict[str, dict] = {}
     for name, cfg in registry.items():
@@ -203,7 +217,7 @@ def _load_providers() -> dict[str, dict]:
 
     if not providers:
         logger.warning("[GRAEAE] config.toml [graeae.providers] is empty — using built-in defaults")
-        return {k: dict(v) for k, v in _BUILTIN_PROVIDERS.items()}
+        return _builtin_fallback()
 
     logger.info(f"[GRAEAE] loaded {len(providers)} providers from config.toml: {list(providers)}")
     return providers
