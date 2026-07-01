@@ -959,3 +959,57 @@ async def get_consultation_artifacts(
         if hasattr(consultation["created"], "isoformat")
         else str(consultation["created"]),
     )
+
+
+# Verbatim classified recall — paging/section helpers live in core
+# (mnemos.domain.consultation_recall) so this route and the
+# graeae_get_consultation MCP tool share identical semantics.
+from mnemos.domain.consultation_recall import (  # noqa: E402
+    VALID_FULL_SECTIONS as _VALID_FULL_SECTIONS,
+    paginate_full_parts as _paginate_full_parts,
+    select_full_parts as _select_full_parts,
+)
+
+
+@router.get("/consultations/{consultation_id}/full")
+@limiter.limit("30/minute")
+async def get_consultation_full(
+    request: Request,
+    consultation_id: str,
+    section: str = Query("all", description="all | source | quorum | synthesis | muses"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(6000, ge=500, le=50000),
+    namespace: Optional[str] = Query(None),
+    user: UserContext = Depends(get_current_user),
+):
+    """Recall one GRAEAE consultation, verbatim and classified, paged.
+
+    Non-root callers only see their own consultations. One record per page:
+    ``total_pages`` reports how many pages the requested ``section`` spans so
+    a caller can walk the full untruncated result.
+    """
+    if section not in _VALID_FULL_SECTIONS:
+        raise HTTPException(status_code=422, detail=f"section must be one of {_VALID_FULL_SECTIONS}")
+    root = is_root(user)
+    target_ns = scope_namespace(user, namespace)
+    backend = require_consultations_backend()
+    async with backend.transactional() as tx:
+        full = await backend.consultations.fetch_consultation_full(
+            tx,
+            consultation_id,
+            root=root,
+            user_id=user.user_id,
+            namespace=target_ns if (namespace is not None or not root) else None,
+        )
+    if full is None:
+        raise HTTPException(status_code=404, detail="consultation not found")
+    parts = _select_full_parts(full, section)
+    page_parts, total_pages = _paginate_full_parts(parts, page_size, page)
+    return {
+        "consultation_id": consultation_id,
+        "section": section,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "parts": page_parts,
+    }
