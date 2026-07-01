@@ -6,11 +6,12 @@
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import time
 from collections import defaultdict, deque
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -959,3 +960,105 @@ async def get_consultation_artifacts(
         if hasattr(consultation["created"], "isoformat")
         else str(consultation["created"]),
     )
+
+
+# ── /v1/consultations/{consultation_id}/full — verbatim classified recall ──
+#
+# The MCP tool response can be truncated by the client; this endpoint makes
+# the full verbatim consultation recoverable, classified into four record
+# types (source / quorum / synthesis / muses) and PAGED so an arbitrarily
+# long result is retrievable page by page. Owner-scoped: a non-root caller
+# only recalls its own consultations (enforced in the persistence layer;
+# an invisible/unknown id returns 404). No schema change — assembled at read
+# time from graeae_consultations + graeae_audit_log.
+_VALID_FULL_SECTIONS = ("all", "source", "quorum", "synthesis", "muses")
+
+
+def _serialise_full_part(part: dict[str, Any]) -> tuple[str, int]:
+    """Return ``(rendered_json, char_len)`` for a part, for paging math."""
+    rendered = json.dumps(part, ensure_ascii=False, default=str)
+    return rendered, len(rendered)
+
+
+def _select_full_parts(full: dict[str, Any], section: str) -> list[dict[str, Any]]:
+    """Ordered list of classified parts for the requested section."""
+    parts: list[dict[str, Any]] = []
+    if section in ("all", "source"):
+        parts.append({"type": "source", **(full.get("source") or {})})
+    if section in ("all", "quorum"):
+        parts.append({"type": "quorum", **(full.get("quorum") or {})})
+    if section in ("all", "synthesis"):
+        parts.append({"type": "synthesis", **(full.get("synthesis") or {})})
+    if section in ("all", "muses"):
+        muses = full.get("muses") or []
+        for idx, muse in enumerate(muses, start=1):
+            parts.append({"type": f"muse:{idx}/{len(muses)}", **muse})
+    return parts
+
+
+def _paginate_full_parts(
+    parts: list[dict[str, Any]], page_size: int, page: int
+) -> tuple[list[dict[str, Any]], int]:
+    """Part-level paging; parts longer than ``page_size`` split into numbered
+    sub-pages (never mid-part, never mid-codepoint). Returns (page_parts,
+    total_pages)."""
+    rendered: list[dict[str, Any]] = []
+    for part in parts:
+        text, length = _serialise_full_part(part)
+        if length <= page_size:
+            rendered.append(part)
+            continue
+        chunks = [text[i : i + page_size] for i in range(0, length, page_size)]
+        base_type = part.get("type", "part")
+        for idx, chunk in enumerate(chunks, start=1):
+            rendered.append(
+                {"type": f"{base_type}#{idx}/{len(chunks)}", "_chunk": idx, "_chunks": len(chunks), "text": chunk}
+            )
+    total_pages = len(rendered)
+    if page < 1 or page > total_pages:
+        return [], total_pages
+    return [rendered[page - 1]], total_pages
+
+
+@router.get("/consultations/{consultation_id}/full")
+@limiter.limit("30/minute")
+async def get_consultation_full(
+    request: Request,
+    consultation_id: str,
+    section: str = Query("all", description="all | source | quorum | synthesis | muses"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(6000, ge=500, le=50000),
+    namespace: Optional[str] = Query(None),
+    user: UserContext = Depends(get_current_user),
+):
+    """Recall one GRAEAE consultation, verbatim and classified, paged.
+
+    Non-root callers only see their own consultations. One record per page:
+    ``total_pages`` reports how many pages the requested ``section`` spans so
+    a caller can walk the full untruncated result.
+    """
+    if section not in _VALID_FULL_SECTIONS:
+        raise HTTPException(status_code=422, detail=f"section must be one of {_VALID_FULL_SECTIONS}")
+    root = is_root(user)
+    target_ns = scope_namespace(user, namespace)
+    backend = require_consultations_backend()
+    async with backend.transactional() as tx:
+        full = await backend.consultations.fetch_consultation_full(
+            tx,
+            consultation_id,
+            root=root,
+            user_id=user.user_id,
+            namespace=target_ns if (namespace is not None or not root) else None,
+        )
+    if full is None:
+        raise HTTPException(status_code=404, detail="consultation not found")
+    parts = _select_full_parts(full, section)
+    page_parts, total_pages = _paginate_full_parts(parts, page_size, page)
+    return {
+        "consultation_id": consultation_id,
+        "section": section,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "parts": page_parts,
+    }
