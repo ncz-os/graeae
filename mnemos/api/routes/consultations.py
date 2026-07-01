@@ -6,12 +6,11 @@
 
 import hashlib
 import hmac
-import json
 import logging
 import os
 import time
 from collections import defaultdict, deque
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -962,62 +961,14 @@ async def get_consultation_artifacts(
     )
 
 
-# ── /v1/consultations/{consultation_id}/full — verbatim classified recall ──
-#
-# The MCP tool response can be truncated by the client; this endpoint makes
-# the full verbatim consultation recoverable, classified into four record
-# types (source / quorum / synthesis / muses) and PAGED so an arbitrarily
-# long result is retrievable page by page. Owner-scoped: a non-root caller
-# only recalls its own consultations (enforced in the persistence layer;
-# an invisible/unknown id returns 404). No schema change — assembled at read
-# time from graeae_consultations + graeae_audit_log.
-_VALID_FULL_SECTIONS = ("all", "source", "quorum", "synthesis", "muses")
-
-
-def _serialise_full_part(part: dict[str, Any]) -> tuple[str, int]:
-    """Return ``(rendered_json, char_len)`` for a part, for paging math."""
-    rendered = json.dumps(part, ensure_ascii=False, default=str)
-    return rendered, len(rendered)
-
-
-def _select_full_parts(full: dict[str, Any], section: str) -> list[dict[str, Any]]:
-    """Ordered list of classified parts for the requested section."""
-    parts: list[dict[str, Any]] = []
-    if section in ("all", "source"):
-        parts.append({"type": "source", **(full.get("source") or {})})
-    if section in ("all", "quorum"):
-        parts.append({"type": "quorum", **(full.get("quorum") or {})})
-    if section in ("all", "synthesis"):
-        parts.append({"type": "synthesis", **(full.get("synthesis") or {})})
-    if section in ("all", "muses"):
-        muses = full.get("muses") or []
-        for idx, muse in enumerate(muses, start=1):
-            parts.append({"type": f"muse:{idx}/{len(muses)}", **muse})
-    return parts
-
-
-def _paginate_full_parts(
-    parts: list[dict[str, Any]], page_size: int, page: int
-) -> tuple[list[dict[str, Any]], int]:
-    """Part-level paging; parts longer than ``page_size`` split into numbered
-    sub-pages (never mid-part, never mid-codepoint). Returns (page_parts,
-    total_pages)."""
-    rendered: list[dict[str, Any]] = []
-    for part in parts:
-        text, length = _serialise_full_part(part)
-        if length <= page_size:
-            rendered.append(part)
-            continue
-        chunks = [text[i : i + page_size] for i in range(0, length, page_size)]
-        base_type = part.get("type", "part")
-        for idx, chunk in enumerate(chunks, start=1):
-            rendered.append(
-                {"type": f"{base_type}#{idx}/{len(chunks)}", "_chunk": idx, "_chunks": len(chunks), "text": chunk}
-            )
-    total_pages = len(rendered)
-    if page < 1 or page > total_pages:
-        return [], total_pages
-    return [rendered[page - 1]], total_pages
+# Verbatim classified recall — paging/section helpers live in core
+# (mnemos.domain.consultation_recall) so this route and the
+# graeae_get_consultation MCP tool share identical semantics.
+from mnemos.domain.consultation_recall import (  # noqa: E402
+    VALID_FULL_SECTIONS as _VALID_FULL_SECTIONS,
+    paginate_full_parts as _paginate_full_parts,
+    select_full_parts as _select_full_parts,
+)
 
 
 @router.get("/consultations/{consultation_id}/full")
