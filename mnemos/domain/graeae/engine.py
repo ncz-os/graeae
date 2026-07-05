@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 from collections.abc import AsyncIterator
 from difflib import SequenceMatcher
@@ -69,6 +70,11 @@ from mnemos.domain.graeae.provider_worker import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_OUTPUT_TOKENS = 8192
+_DEFAULT_MAX_CANDIDATES = 1
+_MAX_STOP_SEQUENCES = 4
+_MAX_STOP_SEQUENCE_CHARS = 512
 
 
 # #192: removed `ProviderResponse` (dataclass) — declared but
@@ -467,6 +473,99 @@ def _anthropic_tool_choice(tool_choice: Any) -> Any:
         if tool_choice.get("type") == "function" and fn.get("name"):
             return {"type": "tool", "name": fn["name"]}
     raise ValueError(f"unsupported Anthropic tool_choice {tool_choice!r}")
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, minimum), maximum)
+
+
+def _bounded_float(value: Any, *, minimum: float, maximum: float) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return min(max(parsed, minimum), maximum)
+
+
+def _max_output_tokens() -> int:
+    return _positive_int_env("MNEMOS_GRAEAE_MAX_OUTPUT_TOKENS", _DEFAULT_MAX_OUTPUT_TOKENS)
+
+
+def _max_candidates() -> int:
+    return _positive_int_env("MNEMOS_GRAEAE_MAX_CANDIDATES", _DEFAULT_MAX_CANDIDATES)
+
+
+def _bounded_stop_sequences(value: Any) -> str | list[str] | None:
+    if isinstance(value, str):
+        return value[:_MAX_STOP_SEQUENCE_CHARS]
+    if isinstance(value, list):
+        items = [str(item)[:_MAX_STOP_SEQUENCE_CHARS] for item in value[:_MAX_STOP_SEQUENCES]]
+        return items
+    return None
+
+
+def _bounded_generation_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not params:
+        return {}
+    bounded: Dict[str, Any] = {}
+    if "max_tokens" in params:
+        bounded["max_tokens"] = _bounded_int(
+            params["max_tokens"],
+            default=4096,
+            minimum=1,
+            maximum=_max_output_tokens(),
+        )
+    if "temperature" in params:
+        temperature = _bounded_float(params["temperature"], minimum=0.0, maximum=2.0)
+        if temperature is not None:
+            bounded["temperature"] = temperature
+    if "top_p" in params:
+        top_p = _bounded_float(params["top_p"], minimum=0.0, maximum=1.0)
+        if top_p is not None:
+            bounded["top_p"] = top_p
+    return bounded
+
+
+def _bounded_request_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not params:
+        return {}
+    bounded: Dict[str, Any] = {}
+    for field in ("tools", "tool_choice", "response_format", "user"):
+        if field in params:
+            bounded[field] = params[field]
+    if "parallel_tool_calls" in params and isinstance(params["parallel_tool_calls"], bool):
+        bounded["parallel_tool_calls"] = params["parallel_tool_calls"]
+    if "stop" in params:
+        stop = _bounded_stop_sequences(params["stop"])
+        if stop is not None:
+            bounded["stop"] = stop
+    if "n" in params:
+        bounded["n"] = _bounded_int(
+            params["n"],
+            default=1,
+            minimum=1,
+            maximum=_max_candidates(),
+        )
+    for field in ("presence_penalty", "frequency_penalty"):
+        if field in params:
+            penalty = _bounded_float(params[field], minimum=-2.0, maximum=2.0)
+            if penalty is not None:
+                bounded[field] = penalty
+    return bounded
 
 
 def _gemini_part(content: Any) -> list[dict]:
@@ -1393,6 +1492,8 @@ class GraeaeEngine:
         request_params: Optional[Dict[str, Any]] = None,
         messages: Optional[list[dict]] = None,
     ) -> Dict:
+        generation_params = _bounded_generation_params(generation_params)
+        request_params = _bounded_request_params(request_params)
         response = await self.provider_worker(ProviderQueryRequest(
             provider=provider_name,
             model=model_override,

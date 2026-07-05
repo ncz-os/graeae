@@ -30,6 +30,19 @@ GRAEAE is bundled in the Mnemos umbrella image (`ghcr.io/ncz-os/mnemos`) and the
 distribution is present, `mnemos-core` mounts the GRAEAE routes automatically;
 when absent, core boots without them.
 
+## Operator Guardrails
+
+Gateway calls are bounded before GRAEAE dispatches to upstream LLM providers:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MNEMOS_GRAEAE_MAX_OUTPUT_TOKENS` | `8192` | Maximum caller-requested output tokens forwarded to a provider. |
+| `MNEMOS_GRAEAE_MAX_CANDIDATES` | `1` | Maximum caller-requested candidate count (`n`) forwarded to providers that support it. |
+
+The engine also clips temperature/top-p, penalties, and stop sequences to
+provider-safe ranges before dispatch. Operators can raise the token/candidate
+limits explicitly for trusted deployments.
+
 ## Relationship to the rest of MNEMOS
 
 GRAEAE depends on `mnemos-core` (one direction only). It pairs with
