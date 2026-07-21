@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """
 GRAEAE Multi-Provider Consensus Engine
 
@@ -30,12 +28,17 @@ Reliability stack (innermost to outermost):
   _cache           — in-memory LRU keyed on normalised prompt hash (1h TTL)
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import math
 import os
 import re
+import threading
+import time
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from difflib import SequenceMatcher
 from itertools import combinations
@@ -54,11 +57,6 @@ from mnemos.core.resilience import (
 from mnemos.domain.providers import _PROVIDER_ENV_VARS, get_key
 
 
-def _env_var_hint(key_name: str) -> str:
-    """Return the env-var name an operator would export to bypass
-    the Provider Registry File for a given key_name. Used in error
-    messages so the hint is actionable."""
-    return _PROVIDER_ENV_VARS.get(key_name, f"<{key_name.upper()}_API_KEY>")
 from mnemos.domain.graeae._cache import make_response_cache
 from mnemos.domain.graeae._quality import make_quality_tracker
 from mnemos.domain.graeae.elo_sync import get_elo_weights
@@ -71,8 +69,18 @@ from mnemos.domain.graeae.provider_worker import (
 
 logger = logging.getLogger(__name__)
 
+
+def _env_var_hint(key_name: str) -> str:
+    """Return the env-var name an operator would export to bypass
+    the Provider Registry File for a given key_name. Used in error
+    messages so the hint is actionable."""
+    return _PROVIDER_ENV_VARS.get(key_name, f"<{key_name.upper()}_API_KEY>")
+
+
 _DEFAULT_MAX_OUTPUT_TOKENS = 8192
 _DEFAULT_MAX_CANDIDATES = 1
+_DEFAULT_RANKED_LINEUP_TTL_SECONDS = 60
+_RANKED_LINEUP_CACHE_MAX_ENTRIES = 128
 _MAX_STOP_SEQUENCES = 4
 _MAX_STOP_SEQUENCE_CHARS = 512
 
@@ -121,7 +129,6 @@ def _normalize_gemini_finish_reason(raw: str | None) -> str:
     return GEMINI_FINISH_REASON_MAP.get(raw_value.upper(), "stop")
 
 
-
 # Built-in provider defaults — used when config.toml has no [graeae.providers] section.
 # Operators override these (or add new providers) via config.toml exclusively.
 #
@@ -134,17 +141,26 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
         # iter 56 registry-align: MiniMax-M2.7 FP4 is the current Together
         # default per llm-usage-policy-2026-05-22.md ($0.40/$1.20, 4M ctx,
         # weight=0.78 in model_registry).
-        "model": "MiniMaxAI/MiniMax-M2.7", "weight": 0.78, "api": "openai", "key_name": "together_ai",
+        "model": "MiniMaxAI/MiniMax-M2.7",
+        "weight": 0.78,
+        "api": "openai",
+        "key_name": "together_ai",
     },
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "llama-3.3-70b-versatile", "weight": 0.80, "api": "openai", "key_name": "groq",
+        "model": "llama-3.3-70b-versatile",
+        "weight": 0.80,
+        "api": "openai",
+        "key_name": "groq",
     },
     "openai": {
         "url": "https://api.openai.com/v1/chat/completions",
         # iter 56 registry-align: gpt-5.5 is arena rank 8 (score 1481) per
         # 2026-05-28 snapshot; supersedes 5.2-chat-latest.
-        "model": "gpt-5.5", "weight": 0.88, "api": "openai", "key_name": "openai",
+        "model": "gpt-5.5",
+        "weight": 0.88,
+        "api": "openai",
+        "key_name": "openai",
     },
     "claude": {
         "url": "https://api.anthropic.com/v1/messages",
@@ -152,28 +168,43 @@ _BUILTIN_PROVIDERS: dict[str, dict] = {
         # short-circuit (consult() gather block) handles the latency by
         # cancelling whichever muse is slowest once quorum reached, so opus
         # being slow on arch-design prompts is no longer a blocker.
-        "model": "claude-opus-4-8", "weight": 0.90, "api": "anthropic", "key_name": "claude",
+        "model": "claude-opus-4-8",
+        "weight": 0.90,
+        "api": "anthropic",
+        "key_name": "claude",
     },
     "perplexity": {
         "url": "https://api.perplexity.ai/chat/completions",
-        "model": "sonar-pro", "weight": 0.88, "api": "openai", "key_name": "perplexity",
+        "model": "sonar-pro",
+        "weight": 0.88,
+        "api": "openai",
+        "key_name": "perplexity",
     },
     "xai": {
         "url": "https://api.x.ai/v1/chat/completions",
         # iter 56 registry-align: grok-4.20-0309-reasoning is arena rank 21
         # (score 1453) per 2026-05-28 snapshot; supersedes 4-1-fast.
-        "model": "grok-4.20-0309-reasoning", "weight": 0.86, "api": "openai", "key_name": "xai",
+        "model": "grok-4.20-0309-reasoning",
+        "weight": 0.86,
+        "api": "openai",
+        "key_name": "xai",
     },
     "nvidia": {
         "url": "https://integrate.api.nvidia.com/v1/chat/completions",
         # iter 56 registry-align: NGC Kimi K2.6 is arena rank 19 (score
         # 1457) + 80.2% SWE-bench Verified, free Tier-A per
         # llm-usage-policy-2026-05-22.md.
-        "model": "moonshotai/kimi-k2.6", "weight": 0.80, "api": "openai", "key_name": "nvidia",
+        "model": "moonshotai/kimi-k2.6",
+        "weight": 0.80,
+        "api": "openai",
+        "key_name": "nvidia",
     },
     "gemini": {
         "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent",
-        "model": "gemini-3.1-pro-preview", "weight": 0.88, "api": "gemini", "key_name": "gemini",
+        "model": "gemini-3.1-pro-preview",
+        "weight": 0.88,
+        "api": "gemini",
+        "key_name": "gemini",
     },
 }
 
@@ -189,7 +220,10 @@ def _builtin_fallback() -> dict[str, dict]:
     config.toml are intentionally left untagged — absence of the tag means
     operator-configured.
     """
-    return {name: {**dict(cfg), "_source": "builtin"} for name, cfg in _BUILTIN_PROVIDERS.items()}
+    return {
+        name: {**dict(cfg), "_source": "builtin"}
+        for name, cfg in _BUILTIN_PROVIDERS.items()
+    }
 
 
 def _load_providers() -> dict[str, dict]:
@@ -201,6 +235,7 @@ def _load_providers() -> dict[str, dict]:
     """
     try:
         from mnemos.core.config import GRAEAE_CONFIG
+
         registry = GRAEAE_CONFIG.get("providers", {})
     except ImportError:
         registry = {}
@@ -212,20 +247,28 @@ def _load_providers() -> dict[str, dict]:
     providers: dict[str, dict] = {}
     for name, cfg in registry.items():
         if not cfg.get("enabled", True):
-            logger.info(f"[GRAEAE] provider '{name}' disabled in config.toml — skipping")
+            logger.info(
+                f"[GRAEAE] provider '{name}' disabled in config.toml — skipping"
+            )
             continue
         required = {"url", "model", "weight", "api", "key_name"}
         missing = required - cfg.keys()
         if missing:
-            logger.warning(f"[GRAEAE] provider '{name}' missing fields {missing} — skipping")
+            logger.warning(
+                f"[GRAEAE] provider '{name}' missing fields {missing} — skipping"
+            )
             continue
         providers[name] = dict(cfg)
 
     if not providers:
-        logger.warning("[GRAEAE] config.toml [graeae.providers] is empty — using built-in defaults")
+        logger.warning(
+            "[GRAEAE] config.toml [graeae.providers] is empty — using built-in defaults"
+        )
         return _builtin_fallback()
 
-    logger.info(f"[GRAEAE] loaded {len(providers)} providers from config.toml: {list(providers)}")
+    logger.info(
+        f"[GRAEAE] loaded {len(providers)} providers from config.toml: {list(providers)}"
+    )
     return providers
 
 
@@ -266,7 +309,11 @@ def _provider_scope(cfg: dict) -> str:
         return "local"
     try:
         ip = ipaddress.ip_address(host)
-        return "local" if (ip.is_private or ip.is_loopback or ip.is_link_local) else "external"
+        return (
+            "local"
+            if (ip.is_private or ip.is_loopback or ip.is_link_local)
+            else "external"
+        )
     except ValueError:
         # Bare hostname (no dots) => LAN box; dotted FQDN => public cloud.
         return "local" if "." not in host else "external"
@@ -307,8 +354,14 @@ def _as_list(value: Any) -> list[Any]:
 def _provider_stream_error(data: dict[str, Any]) -> ProviderStreamError:
     raw_error = data.get("error")
     if isinstance(raw_error, dict):
-        message = str(raw_error.get("message") or raw_error.get("detail") or "Provider stream error")
-        error_type = str(raw_error.get("type") or raw_error.get("code") or "provider_error")
+        message = str(
+            raw_error.get("message")
+            or raw_error.get("detail")
+            or "Provider stream error"
+        )
+        error_type = str(
+            raw_error.get("type") or raw_error.get("code") or "provider_error"
+        )
         raw_status = raw_error.get("status_code") or raw_error.get("status")
         try:
             status_code = int(raw_status) if raw_status is not None else 400
@@ -350,7 +403,9 @@ def _anthropic_content_parts(content: Any) -> list[dict]:
                 image_url = block.get("image_url") or {}
                 url = image_url.get("url") if isinstance(image_url, dict) else None
                 if url:
-                    parts.append({"type": "image", "source": {"type": "url", "url": url}})
+                    parts.append(
+                        {"type": "image", "source": {"type": "url", "url": url}}
+                    )
         return parts or [{"type": "text", "text": ""}]
     return [{"type": "text", "text": _content_text(content)}]
 
@@ -377,23 +432,29 @@ def _anthropic_tool_use_blocks(tool_calls: Any) -> list[dict]:
         call_id = call.get("id")
         if not name or not call_id:
             continue
-        blocks.append({
-            "type": "tool_use",
-            "id": call_id,
-            "name": name,
-            "input": _anthropic_tool_input(function.get("arguments")),
-        })
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": call_id,
+                "name": name,
+                "input": _anthropic_tool_input(function.get("arguments")),
+            }
+        )
     return blocks
 
 
-def _append_anthropic_message(messages: list[dict], role: str, content: list[dict]) -> None:
+def _append_anthropic_message(
+    messages: list[dict], role: str, content: list[dict]
+) -> None:
     if messages and messages[-1]["role"] == role:
         messages[-1]["content"].extend(content)
         return
     messages.append({"role": role, "content": content})
 
 
-def _anthropic_messages(messages: Optional[list[dict]], prompt: str) -> tuple[Optional[str], list[dict]]:
+def _anthropic_messages(
+    messages: Optional[list[dict]], prompt: str
+) -> tuple[Optional[str], list[dict]]:
     if not messages:
         return None, [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
 
@@ -426,9 +487,13 @@ def _anthropic_messages(messages: Optional[list[dict]], prompt: str) -> tuple[Op
             ]
             _append_anthropic_message(converted, "user", content)
             continue
-        _append_anthropic_message(converted, "user", _anthropic_content_parts(msg.get("content")))
+        _append_anthropic_message(
+            converted, "user", _anthropic_content_parts(msg.get("content"))
+        )
     if not converted:
-        converted.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
+        converted.append(
+            {"role": "user", "content": [{"type": "text", "text": prompt}]}
+        )
     return ("\n\n".join(system_parts) if system_parts else None), converted
 
 
@@ -447,11 +512,13 @@ def _anthropic_tools(tools: list[dict]) -> list[dict]:
     for tool in tools:
         if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
             fn = tool["function"]
-            converted.append({
-                "name": fn.get("name"),
-                "description": fn.get("description", ""),
-                "input_schema": fn.get("parameters", {"type": "object"}),
-            })
+            converted.append(
+                {
+                    "name": fn.get("name"),
+                    "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters", {"type": "object"}),
+                }
+            )
         else:
             converted.append(tool)
     return converted
@@ -502,18 +569,63 @@ def _bounded_float(value: Any, *, minimum: float, maximum: float) -> float | Non
 
 
 def _max_output_tokens() -> int:
-    return _positive_int_env("MNEMOS_GRAEAE_MAX_OUTPUT_TOKENS", _DEFAULT_MAX_OUTPUT_TOKENS)
+    return _positive_int_env(
+        "MNEMOS_GRAEAE_MAX_OUTPUT_TOKENS", _DEFAULT_MAX_OUTPUT_TOKENS
+    )
 
 
 def _max_candidates() -> int:
     return _positive_int_env("MNEMOS_GRAEAE_MAX_CANDIDATES", _DEFAULT_MAX_CANDIDATES)
 
 
+def _ranked_lineup_ttl_seconds() -> int:
+    return _positive_int_env(
+        "MNEMOS_GRAEAE_RANKED_LINEUP_TTL_SECONDS",
+        _DEFAULT_RANKED_LINEUP_TTL_SECONDS,
+    )
+
+
+class _RankedLineupCache:
+    """Thread-safe TTL/LRU cache for model_registry ranking lookups."""
+
+    def __init__(
+        self, ttl_seconds: int, max_entries: int = _RANKED_LINEUP_CACHE_MAX_ENTRIES
+    ):
+        self.ttl = ttl_seconds
+        self.max_entries = max_entries
+        self._store: OrderedDict[
+            tuple[str, ...], tuple[float, list[tuple[str, str | None, float]]]
+        ] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key: tuple[str, ...]) -> list[tuple[str, str | None, float]] | None:
+        with self._lock:
+            if key not in self._store:
+                return None
+            stored_at, value = self._store[key]
+            if time.monotonic() - stored_at > self.ttl:
+                del self._store[key]
+                return None
+            self._store.move_to_end(key)
+            return list(value)
+
+    def set(
+        self, key: tuple[str, ...], value: list[tuple[str, str | None, float]]
+    ) -> None:
+        with self._lock:
+            self._store[key] = (time.monotonic(), list(value))
+            self._store.move_to_end(key)
+            while len(self._store) > self.max_entries:
+                self._store.popitem(last=False)
+
+
 def _bounded_stop_sequences(value: Any) -> str | list[str] | None:
     if isinstance(value, str):
         return value[:_MAX_STOP_SEQUENCE_CHARS]
     if isinstance(value, list):
-        items = [str(item)[:_MAX_STOP_SEQUENCE_CHARS] for item in value[:_MAX_STOP_SEQUENCES]]
+        items = [
+            str(item)[:_MAX_STOP_SEQUENCE_CHARS] for item in value[:_MAX_STOP_SEQUENCES]
+        ]
         return items
     return None
 
@@ -547,7 +659,9 @@ def _bounded_request_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     for field in ("tools", "tool_choice", "response_format", "user"):
         if field in params:
             bounded[field] = params[field]
-    if "parallel_tool_calls" in params and isinstance(params["parallel_tool_calls"], bool):
+    if "parallel_tool_calls" in params and isinstance(
+        params["parallel_tool_calls"], bool
+    ):
         bounded["parallel_tool_calls"] = params["parallel_tool_calls"]
     if "stop" in params:
         stop = _bounded_stop_sequences(params["stop"])
@@ -585,7 +699,9 @@ def _gemini_part(content: Any) -> list[dict]:
     return [{"text": _content_text(content)}]
 
 
-def _gemini_contents(messages: Optional[list[dict]], prompt: str) -> tuple[Optional[dict], list[dict]]:
+def _gemini_contents(
+    messages: Optional[list[dict]], prompt: str
+) -> tuple[Optional[dict], list[dict]]:
     if not messages:
         return None, [{"role": "user", "parts": [{"text": prompt}]}]
 
@@ -603,7 +719,9 @@ def _gemini_contents(messages: Optional[list[dict]], prompt: str) -> tuple[Optio
                 f"Gemini does not support role={role}; supported: system, user, assistant"
             )
         gemini_role = "model" if role == "assistant" else "user"
-        contents.append({"role": gemini_role, "parts": _gemini_part(msg.get("content"))})
+        contents.append(
+            {"role": gemini_role, "parts": _gemini_part(msg.get("content"))}
+        )
     if not contents:
         contents.append({"role": "user", "parts": [{"text": prompt}]})
     system_instruction = None
@@ -626,7 +744,9 @@ class GraeaeEngine:
             for name, w in elo.items():
                 if name in self.providers:
                     self.providers[name]["weight"] = w
-            logger.info(f"[GRAEAE] Elo weights applied for: {[p for p in elo if p in self.providers]}")
+            logger.info(
+                f"[GRAEAE] Elo weights applied for: {[p for p in elo if p in self.providers]}"
+            )
 
         # Reliability stack — instantiated here; _concurrency lazily initialised
         # on first consult() call because asyncio.Semaphore needs a running loop.
@@ -639,7 +759,10 @@ class GraeaeEngine:
         self._rate_limiters = make_rate_limiter_pool(self._settings)
         provider_weights = {p: cfg["weight"] for p, cfg in self.providers.items()}
         self._quality = make_quality_tracker(self._settings, provider_weights)
-        self._cache = make_response_cache(self._settings, ttl_seconds=3600, max_entries=500)
+        self._cache = make_response_cache(
+            self._settings, ttl_seconds=3600, max_entries=500
+        )
+        self._ranked_lineup_cache = _RankedLineupCache(_ranked_lineup_ttl_seconds())
         self._concurrency: Optional[Any] = None
         self.provider_worker: ProviderWorker = LocalProviderWorker(self)
 
@@ -710,15 +833,23 @@ class GraeaeEngine:
                 cfg = self.providers[name]
                 api_key = get_key(cfg["key_name"])
                 if not api_key:
-                    logger.info("[GRAEAE] reload: %s → no api key, keeping %s",
-                                name, cfg.get("model"))
+                    logger.info(
+                        "[GRAEAE] reload: %s → no api key, keeping %s",
+                        name,
+                        cfg.get("model"),
+                    )
                     continue
                 candidates = await _ranked_candidates(
-                    conn, mapping["registry_provider"], mapping["prefer"],
+                    conn,
+                    mapping["registry_provider"],
+                    mapping["prefer"],
                 )
                 if not candidates:
-                    logger.info("[GRAEAE] reload: %s → registry empty, keeping %s",
-                                name, cfg.get("model"))
+                    logger.info(
+                        "[GRAEAE] reload: %s → registry empty, keeping %s",
+                        name,
+                        cfg.get("model"),
+                    )
                     continue
                 plans[name] = candidates[:_PROBE_MAX_CANDIDATES]
                 api_keys[name] = api_key
@@ -754,13 +885,19 @@ class GraeaeEngine:
             if chosen is None:
                 logger.warning(
                     "[GRAEAE] %s: all %d candidates failed probe (%s) — keeping %s",
-                    name, len(tried), tried, cfg.get("model"),
+                    name,
+                    len(tried),
+                    tried,
+                    cfg.get("model"),
                 )
                 continue
             if tried:
                 logger.info(
                     "[GRAEAE] %s: probe failures %s → falling back to %s (n-%d)",
-                    name, tried, chosen, len(tried),
+                    name,
+                    tried,
+                    chosen,
+                    len(tried),
                 )
             old = cfg.get("model")
             if old == chosen:
@@ -802,15 +939,24 @@ class GraeaeEngine:
         mode = mode or "auto"
         if mode == "single":
             return await self.route_single(
-                prompt, task_type, timeout=timeout, selection=selection,
+                prompt,
+                task_type,
+                timeout=timeout,
+                selection=selection,
             )
         if mode == "debate":
             return await self.route_debate(
-                prompt, task_type, timeout=timeout, selection=selection,
+                prompt,
+                task_type,
+                timeout=timeout,
+                selection=selection,
             )
         if mode == "majority":
             return await self.route_majority(
-                prompt, task_type, timeout=timeout, selection=selection,
+                prompt,
+                task_type,
+                timeout=timeout,
+                selection=selection,
             )
         if mode not in {"auto", "local", "external", "all"}:
             raise ValueError(f"unsupported consultation mode {mode!r}")
@@ -822,8 +968,14 @@ class GraeaeEngine:
         cache_model = _selection_cache_tag(selection) if selection else "default"
         cached = await call_maybe_async(self._cache.get, prompt, task_type, cache_model)
         if cached is not None:
-            logger.info(f"[GRAEAE] cache hit (task_type={task_type}, model={cache_model})")
-            return {"all_responses": cached, "cache_hit": True, **_compute_consensus(cached)}
+            logger.info(
+                f"[GRAEAE] cache hit (task_type={task_type}, model={cache_model})"
+            )
+            return {
+                "all_responses": cached,
+                "cache_hit": True,
+                **_compute_consensus(cached),
+            }
 
         concurrency = self._get_concurrency()
 
@@ -843,18 +995,23 @@ class GraeaeEngine:
             # verbatim and is not scope-filtered.)
             if mode in {"local", "external"}:
                 candidate_providers = [
-                    p for p in candidate_providers
+                    p
+                    for p in candidate_providers
                     if _provider_scope(self.providers[p]) == mode
                 ]
                 logger.info(
                     "[GRAEAE] mode=%s scope filter -> %d/%d providers: %s",
-                    mode, len(candidate_providers), len(self.providers),
+                    mode,
+                    len(candidate_providers),
+                    len(self.providers),
                     candidate_providers,
                 )
                 if not candidate_providers:
                     logger.error(
                         "[GRAEAE] mode=%s selected zero providers "
-                        "(no muse classified as %s)", mode, mode,
+                        "(no muse classified as %s)",
+                        mode,
+                        mode,
                     )
                     return {
                         "all_responses": {},
@@ -904,10 +1061,15 @@ class GraeaeEngine:
                 if override and name in self.providers:
                     overrides[name] = override
         tasks = [
-            asyncio.create_task(self._call_provider_worker(
-                name, prompt, task_type, timeout,
-                model_override=overrides.get(name),
-            ))
+            asyncio.create_task(
+                self._call_provider_worker(
+                    name,
+                    prompt,
+                    task_type,
+                    timeout,
+                    model_override=overrides.get(name),
+                )
+            )
             for name in active
         ]
 
@@ -941,6 +1103,7 @@ class GraeaeEngine:
                     results[i] = r
             else:
                 import time as _time
+
                 successes = 0
                 remaining = set(tasks)
                 task_to_idx = {t: i for i, t in enumerate(tasks)}
@@ -986,26 +1149,29 @@ class GraeaeEngine:
                         t.cancel()
                 if remaining:
                     cancelled = await asyncio.gather(
-                        *remaining, return_exceptions=True,
+                        *remaining,
+                        return_exceptions=True,
                     )
                     for t, r in zip(remaining, cancelled):
                         idx = task_to_idx[t]
                         if results[idx] is None:
-                            results[idx] = r if not isinstance(
-                                r, asyncio.CancelledError
-                            ) else {
-                                "status": "cancelled",
-                                "response_text": "",
-                                "error": (
-                                    "cancelled: quorum reached before this "
-                                    "muse responded"
-                                ),
-                                "latency_ms": 0,
-                                "final_score": 0.0,
-                                "model_id": self.providers.get(
-                                    active[idx], {}
-                                ).get("model", ""),
-                            }
+                            results[idx] = (
+                                r
+                                if not isinstance(r, asyncio.CancelledError)
+                                else {
+                                    "status": "cancelled",
+                                    "response_text": "",
+                                    "error": (
+                                        "cancelled: quorum reached before this "
+                                        "muse responded"
+                                    ),
+                                    "latency_ms": 0,
+                                    "final_score": 0.0,
+                                    "model_id": self.providers.get(active[idx], {}).get(
+                                        "model", ""
+                                    ),
+                                }
+                            )
         except asyncio.CancelledError:
             for task in tasks:
                 if not task.done():
@@ -1034,8 +1200,12 @@ class GraeaeEngine:
                 }
             else:
                 await call_maybe_async(self._circuit_breakers.record_success, name)
-                await call_maybe_async(self._quality.record_success, name, result.get("latency_ms", 0))
-                result["final_score"] = await call_maybe_async(self._quality.dynamic_weight, name)
+                await call_maybe_async(
+                    self._quality.record_success, name, result.get("latency_ms", 0)
+                )
+                result["final_score"] = await call_maybe_async(
+                    self._quality.dynamic_weight, name
+                )
                 all_responses[name] = result
 
         for name in skipped:
@@ -1043,7 +1213,9 @@ class GraeaeEngine:
 
         # ── Cache successful result ──────────────────────────────────────────
         if any(r["status"] == "success" for r in all_responses.values()):
-            await call_maybe_async(self._cache.set, prompt, task_type, all_responses, cache_model)
+            await call_maybe_async(
+                self._cache.set, prompt, task_type, all_responses, cache_model
+            )
 
         # ── Compute consensus fields (v3.2) ──────────────────────────────────
         # ConsultationResponse has exposed consensus_response,
@@ -1064,12 +1236,22 @@ class GraeaeEngine:
     ) -> Dict:
         """Run exactly one highest-weighted muse for the task."""
         lineup = await self._ranked_lineup(
-            task_type=task_type, limit=1, selection=selection,
+            task_type=task_type,
+            limit=1,
+            selection=selection,
         )
         if not lineup:
-            return {"all_responses": {}, "error": "no providers available", **_compute_consensus({})}
+            return {
+                "all_responses": {},
+                "error": "no providers available",
+                **_compute_consensus({}),
+            }
         return await self.consult(
-            prompt, task_type, timeout=timeout, selection=lineup, mode="all",
+            prompt,
+            task_type,
+            timeout=timeout,
+            selection=lineup,
+            mode="all",
         )
 
     async def route_debate(
@@ -1082,7 +1264,9 @@ class GraeaeEngine:
     ) -> Dict:
         """Run a two-round cross-muse debate and return refined responses."""
         lineup = await self._ranked_lineup(
-            task_type=task_type, limit=3, selection=selection,
+            task_type=task_type,
+            limit=3,
+            selection=selection,
         )
         if not lineup:
             empty = _compute_consensus({})
@@ -1095,7 +1279,11 @@ class GraeaeEngine:
             }
 
         round_1 = await self.consult(
-            prompt, task_type, timeout=timeout, selection=lineup, mode="all",
+            prompt,
+            task_type,
+            timeout=timeout,
+            selection=lineup,
+            mode="all",
         )
         round_1_responses = round_1.get("all_responses", {})
         if rounds < 2:
@@ -1120,10 +1308,9 @@ class GraeaeEngine:
                 selection={provider_name: model_override},
                 mode="all",
             )
-            round_2_responses[provider_name] = (
-                refined.get("all_responses", {}).get(provider_name)
-                or _unavailable(self.providers[provider_name]["model"])
-            )
+            round_2_responses[provider_name] = refined.get("all_responses", {}).get(
+                provider_name
+            ) or _unavailable(self.providers[provider_name]["model"])
 
         consensus = _compute_consensus(round_2_responses)
         return {
@@ -1131,8 +1318,10 @@ class GraeaeEngine:
             "round_1": round_1_responses,
             "round_2": round_2_responses,
             **consensus,
-            "cost": float(round_1.get("cost", 0.0) or 0.0) + float(consensus.get("cost", 0.0) or 0.0),
-            "latency_ms": int(round_1.get("latency_ms", 0) or 0) + int(consensus.get("latency_ms", 0) or 0),
+            "cost": float(round_1.get("cost", 0.0) or 0.0)
+            + float(consensus.get("cost", 0.0) or 0.0),
+            "latency_ms": int(round_1.get("latency_ms", 0) or 0)
+            + int(consensus.get("latency_ms", 0) or 0),
         }
 
     async def route_majority(
@@ -1152,10 +1341,16 @@ class GraeaeEngine:
         force a smaller lineup via selection=.
         """
         lineup = await self._ranked_lineup(
-            task_type=task_type, limit=5, selection=selection,
+            task_type=task_type,
+            limit=5,
+            selection=selection,
         )
         result = await self.consult(
-            prompt, task_type, timeout=timeout, selection=lineup or selection, mode="all",
+            prompt,
+            task_type,
+            timeout=timeout,
+            selection=lineup or selection,
+            mode="all",
         )
         all_responses = result.get("all_responses", {})
         quorum_result = _compute_quorum(all_responses, quorum)
@@ -1167,7 +1362,9 @@ class GraeaeEngine:
                 key=lambda name: all_responses[name].get("final_score", 0.0),
             )
             consensus["winning_muse"] = winning_muse
-            consensus["consensus_response"] = all_responses[winning_muse].get("response_text", "")
+            consensus["consensus_response"] = all_responses[winning_muse].get(
+                "response_text", ""
+            )
 
         return {
             **result,
@@ -1186,50 +1383,76 @@ class GraeaeEngine:
         """Pick the highest-weighted providers, preferring model_registry weights."""
         del task_type  # model_registry stores graeae_weight globally today.
         candidates = [
-            name for name in (selection.keys() if selection is not None else self.providers.keys())
+            name
+            for name in (
+                selection.keys() if selection is not None else self.providers.keys()
+            )
             if name in self.providers
         ]
         if not candidates:
             return {}
 
         ranked: list[tuple[str, Optional[str], float]] = []
+        cache_key = tuple(candidates)
+        ranked_lineup_cache = getattr(self, "_ranked_lineup_cache", None)
+        if ranked_lineup_cache is None:
+            ranked_lineup_cache = _RankedLineupCache(_ranked_lineup_ttl_seconds())
+            self._ranked_lineup_cache = ranked_lineup_cache
+
         try:
             import mnemos.core.lifecycle as _lc
 
             if _lc._pool:
-                registry_names = [
-                    _REGISTRY_MAP.get(name, {}).get("registry_provider", name)
-                    for name in candidates
-                ]
-                registry_to_graeae = {
-                    cfg["registry_provider"]: name
-                    for name, cfg in _REGISTRY_MAP.items()
-                }
-                async with _lc._pool.acquire() as conn:
-                    rows = await conn.fetch(
-                        """
-                        SELECT provider, model_id, graeae_weight
-                        FROM model_registry
-                        WHERE provider = ANY($1::text[])
-                          AND available = true
-                          AND deprecated = false
-                        ORDER BY graeae_weight DESC NULLS LAST
-                        """,
-                        registry_names,
-                    )
-                seen: set[str] = set()
-                for row in rows:
-                    registry_provider = _row_get(row, "provider")
-                    name = registry_to_graeae.get(registry_provider, registry_provider)
-                    if name not in candidates or name in seen:
-                        continue
+                registry_ranked = ranked_lineup_cache.get(cache_key)
+                if registry_ranked is None:
+                    registry_names = [
+                        _REGISTRY_MAP.get(name, {}).get("registry_provider", name)
+                        for name in candidates
+                    ]
+                    registry_to_graeae = {
+                        cfg["registry_provider"]: name
+                        for name, cfg in _REGISTRY_MAP.items()
+                    }
+                    async with _lc._pool.acquire() as conn:
+                        rows = await conn.fetch(
+                            """
+                            SELECT provider, model_id, graeae_weight
+                            FROM model_registry
+                            WHERE provider = ANY($1::text[])
+                              AND available = true
+                              AND deprecated = false
+                            ORDER BY graeae_weight DESC NULLS LAST
+                            """,
+                            registry_names,
+                        )
+                    seen: set[str] = set()
+                    registry_ranked = []
+                    for row in rows:
+                        registry_provider = _row_get(row, "provider")
+                        name = registry_to_graeae.get(
+                            registry_provider, registry_provider
+                        )
+                        if name not in candidates or name in seen:
+                            continue
+                        registry_ranked.append(
+                            (
+                                name,
+                                _row_get(row, "model_id"),
+                                float(
+                                    _row_get(
+                                        row,
+                                        "graeae_weight",
+                                        self.providers[name].get("weight", 0.0),
+                                    )
+                                    or 0.0
+                                ),
+                            )
+                        )
+                        seen.add(name)
+                    ranked_lineup_cache.set(cache_key, registry_ranked)
+                for name, registry_model, weight in registry_ranked:
                     model_override = selection.get(name) if selection else None
-                    ranked.append((
-                        name,
-                        model_override or _row_get(row, "model_id"),
-                        float(_row_get(row, "graeae_weight", self.providers[name].get("weight", 0.0)) or 0.0),
-                    ))
-                    seen.add(name)
+                    ranked.append((name, model_override or registry_model, weight))
         except Exception as exc:
             logger.debug("[GRAEAE] model_registry ranking unavailable: %s", exc)
 
@@ -1237,11 +1460,13 @@ class GraeaeEngine:
         for name in candidates:
             if name in ranked_names:
                 continue
-            ranked.append((
-                name,
-                selection.get(name) if selection else None,
-                float(self.providers[name].get("weight", 0.0) or 0.0),
-            ))
+            ranked.append(
+                (
+                    name,
+                    selection.get(name) if selection else None,
+                    float(self.providers[name].get("weight", 0.0) or 0.0),
+                )
+            )
         ranked.sort(key=lambda item: item[2], reverse=True)
         return {name: model_override for name, model_override, _ in ranked[:limit]}
 
@@ -1287,7 +1512,9 @@ class GraeaeEngine:
             Dict with status, response_text, latency_ms, model_id, error
         """
         if provider not in self.providers:
-            logger.warning(f"[GRAEAE] unknown provider '{provider}' — returning unavailable")
+            logger.warning(
+                f"[GRAEAE] unknown provider '{provider}' — returning unavailable"
+            )
             return _unavailable(
                 model or provider,
                 error=f"provider '{provider}' not registered in this deployment",
@@ -1356,7 +1583,9 @@ class GraeaeEngine:
                     query_kwargs["request_params"] = request_params
                 if messages is not None:
                     query_kwargs["messages"] = messages
-                result = await self._call_provider_worker(provider, prompt, task_type, timeout, **query_kwargs)
+                result = await self._call_provider_worker(
+                    provider, prompt, task_type, timeout, **query_kwargs
+                )
             except Exception as e:
                 # Record the failure against the breaker so repeated
                 # gateway-path failures actually trip it, and quality
@@ -1372,7 +1601,9 @@ class GraeaeEngine:
             # the gateway's successes count toward reopening a
             # half-open circuit, not just consultations' successes.
             await call_maybe_async(self._circuit_breakers.record_success, provider)
-            await call_maybe_async(self._quality.record_success, provider, result.get("latency_ms", 0))
+            await call_maybe_async(
+                self._quality.record_success, provider, result.get("latency_ms", 0)
+            )
             logger.debug(
                 f"[GRAEAE] route({provider}, {model or 'default'}) → {result['status']}"
             )
@@ -1399,7 +1630,9 @@ class GraeaeEngine:
         ignoring stream=True.
         """
         if provider not in self.providers:
-            raise RuntimeError(f"provider '{provider}' not registered in this deployment")
+            raise RuntimeError(
+                f"provider '{provider}' not registered in this deployment"
+            )
 
         provider_config = dict(self.providers[provider])
         if model:
@@ -1462,9 +1695,15 @@ class GraeaeEngine:
                             yield {"index": index, "content": content}
                         if msg.get("tool_calls"):
                             yield {"index": index, "tool_calls": msg["tool_calls"]}
-                        finish_reason = choice.get("finish_reason") or result.get("finish_reason") or "stop"
+                        finish_reason = (
+                            choice.get("finish_reason")
+                            or result.get("finish_reason")
+                            or "stop"
+                        )
                         if provider_cfg.get("api") == "gemini":
-                            finish_reason = _normalize_gemini_finish_reason(finish_reason)
+                            finish_reason = _normalize_gemini_finish_reason(
+                                finish_reason
+                            )
                         yield {
                             "index": index,
                             "finish_reason": finish_reason,
@@ -1473,7 +1712,9 @@ class GraeaeEngine:
                         yield {"index": 0, "content": result.get("response_text", "")}
                         finish_reason = result.get("finish_reason") or "stop"
                         if provider_cfg.get("api") == "gemini":
-                            finish_reason = _normalize_gemini_finish_reason(finish_reason)
+                            finish_reason = _normalize_gemini_finish_reason(
+                                finish_reason
+                            )
                         yield {"index": 0, "finish_reason": finish_reason}
             except Exception:
                 await call_maybe_async(self._circuit_breakers.record_failure, provider)
@@ -1486,7 +1727,11 @@ class GraeaeEngine:
             await call_maybe_async(concurrency.release, provider)
 
     async def _call_provider_worker(
-        self, provider_name: str, prompt: str, task_type: str, timeout: int,
+        self,
+        provider_name: str,
+        prompt: str,
+        task_type: str,
+        timeout: int,
         model_override: Optional[str] = None,
         generation_params: Optional[Dict[str, Any]] = None,
         request_params: Optional[Dict[str, Any]] = None,
@@ -1494,18 +1739,20 @@ class GraeaeEngine:
     ) -> Dict:
         generation_params = _bounded_generation_params(generation_params)
         request_params = _bounded_request_params(request_params)
-        response = await self.provider_worker(ProviderQueryRequest(
-            provider=provider_name,
-            model=model_override,
-            messages=messages,
-            params={
-                "prompt": prompt,
-                "task_type": task_type,
-                "timeout": timeout,
-                "generation_params": generation_params,
-                "request_params": request_params,
-            },
-        ))
+        response = await self.provider_worker(
+            ProviderQueryRequest(
+                provider=provider_name,
+                model=model_override,
+                messages=messages,
+                params={
+                    "prompt": prompt,
+                    "task_type": task_type,
+                    "timeout": timeout,
+                    "generation_params": generation_params,
+                    "request_params": request_params,
+                },
+            )
+        )
         return self._provider_worker_payload(response)
 
     # #189: removed `_query_provider` — thin pass-through wrapper
@@ -1544,8 +1791,15 @@ class GraeaeEngine:
         if "top_p" in generation_params:
             payload["top_p"] = generation_params["top_p"]
         for field in (
-            "tools", "tool_choice", "parallel_tool_calls", "response_format", "stop", "n",
-            "presence_penalty", "frequency_penalty", "user",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "response_format",
+            "stop",
+            "n",
+            "presence_penalty",
+            "frequency_penalty",
+            "user",
         ):
             if field in request_params:
                 payload[field] = request_params[field]
@@ -1576,7 +1830,9 @@ class GraeaeEngine:
             messages=messages,
         )
         client = await self._get_client()
-        resp = await client.post(provider["url"], json=payload, headers=headers, timeout=timeout)
+        resp = await client.post(
+            provider["url"], json=payload, headers=headers, timeout=timeout
+        )
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
         data = resp.json()
@@ -1589,11 +1845,13 @@ class GraeaeEngine:
                 continue
             message = choice.get("message")
             message = message if isinstance(message, dict) else {}
-            normalized_choices.append({
-                "index": choice.get("index", i),
-                "message": message,
-                "finish_reason": choice.get("finish_reason") or "stop",
-            })
+            normalized_choices.append(
+                {
+                    "index": choice.get("index", i),
+                    "message": message,
+                    "finish_reason": choice.get("finish_reason") or "stop",
+                }
+            )
         if not normalized_choices:
             raise RuntimeError(f"No valid choices in response: {data}")
         first_message = normalized_choices[0].get("message")
@@ -1628,7 +1886,9 @@ class GraeaeEngine:
             stream=True,
         )
         client = await self._get_client()
-        async with client.stream("POST", provider["url"], json=payload, headers=headers, timeout=timeout) as resp:
+        async with client.stream(
+            "POST", provider["url"], json=payload, headers=headers, timeout=timeout
+        ) as resp:
             if resp.status_code != 200:
                 body = await resp.aread()
                 raise RuntimeError(f"HTTP {resp.status_code}: {body[:200]!r}")
@@ -1641,12 +1901,16 @@ class GraeaeEngine:
                 try:
                     data = json.loads(raw)
                 except json.JSONDecodeError:
-                    logger.debug("[GRAEAE] skipped non-JSON stream frame: %s", raw[:120])
+                    logger.debug(
+                        "[GRAEAE] skipped non-JSON stream frame: %s", raw[:120]
+                    )
                     continue
                 if isinstance(data, dict) and "error" in data:
                     raise _provider_stream_error(data)
                 if not isinstance(data, dict):
-                    logger.debug("[GRAEAE] skipped non-object stream frame: %s", raw[:120])
+                    logger.debug(
+                        "[GRAEAE] skipped non-object stream frame: %s", raw[:120]
+                    )
                     continue
                 for choice in data.get("choices", []):
                     delta = choice.get("delta") or {}
@@ -1697,25 +1961,35 @@ class GraeaeEngine:
         if "tools" in request_params:
             payload["tools"] = _anthropic_tools(request_params["tools"])
         if "tool_choice" in request_params:
-            payload["tool_choice"] = _anthropic_tool_choice(request_params["tool_choice"])
+            payload["tool_choice"] = _anthropic_tool_choice(
+                request_params["tool_choice"]
+            )
         client = await self._get_client()
-        resp = await client.post(provider["url"], json=payload, headers=headers, timeout=timeout)
+        resp = await client.post(
+            provider["url"], json=payload, headers=headers, timeout=timeout
+        )
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
         data = resp.json()
         content = data.get("content", [])
-        text = "".join(block.get("text", "") for block in content if block.get("type") == "text")
+        text = "".join(
+            block.get("text", "") for block in content if block.get("type") == "text"
+        )
         tool_calls = []
         for block in content:
             if block.get("type") == "tool_use":
-                tool_calls.append({
-                    "id": block.get("id"),
-                    "type": "function",
-                    "function": {
-                        "name": block.get("name"),
-                        "arguments": json.dumps(block.get("input", {}), separators=(",", ":")),
-                    },
-                })
+                tool_calls.append(
+                    {
+                        "id": block.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name"),
+                            "arguments": json.dumps(
+                                block.get("input", {}), separators=(",", ":")
+                            ),
+                        },
+                    }
+                )
         message: Dict[str, Any] = {"role": "assistant", "content": text}
         if tool_calls:
             message["tool_calls"] = tool_calls
@@ -1724,7 +1998,13 @@ class GraeaeEngine:
             "response_text": text,
             "latency_ms": 0,
             "model_id": provider["model"],
-            "choices": [{"index": 0, "message": message, "finish_reason": _anthropic_finish_reason(data.get("stop_reason"))}],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": _anthropic_finish_reason(data.get("stop_reason")),
+                }
+            ],
         }
 
     async def _query_gemini(
@@ -1757,7 +2037,10 @@ class GraeaeEngine:
         if "frequency_penalty" in request_params:
             generation_config["frequencyPenalty"] = request_params["frequency_penalty"]
         response_format = request_params.get("response_format")
-        if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+        if (
+            isinstance(response_format, dict)
+            and response_format.get("type") == "json_object"
+        ):
             generation_config["responseMimeType"] = "application/json"
         payload = {
             "contents": contents,
@@ -1766,7 +2049,9 @@ class GraeaeEngine:
         if system_instruction:
             payload["systemInstruction"] = system_instruction
         client = await self._get_client()
-        resp = await client.post(provider["url"], headers=headers, json=payload, timeout=timeout)
+        resp = await client.post(
+            provider["url"], headers=headers, json=payload, timeout=timeout
+        )
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
         data = resp.json()
@@ -1789,12 +2074,18 @@ class GraeaeEngine:
                 if value is not None:
                     text_parts.append(str(value))
             text = "".join(text_parts)
-            choices.append({
-                "index": i,
-                "message": {"role": "assistant", "content": text if text else None},
-                "finish_reason": _normalize_gemini_finish_reason(candidate.get("finishReason")),
-            })
-        text = _chat_message_content_text(choices[0].get("message") if choices else None)
+            choices.append(
+                {
+                    "index": i,
+                    "message": {"role": "assistant", "content": text if text else None},
+                    "finish_reason": _normalize_gemini_finish_reason(
+                        candidate.get("finishReason")
+                    ),
+                }
+            )
+        text = _chat_message_content_text(
+            choices[0].get("message") if choices else None
+        )
         return {
             "status": "success",
             "response_text": text,
@@ -1857,15 +2148,16 @@ def _compute_consensus(all_responses: Dict[str, Dict]) -> Dict:
         if isinstance(c, (int, float)):
             total_cost += float(c)
 
-    latencies = [
-        int(resp.get("latency_ms", 0) or 0)
-        for resp in all_responses.values()
-    ]
+    latencies = [int(resp.get("latency_ms", 0) or 0) for resp in all_responses.values()]
     max_latency = max(latencies) if latencies else 0
 
     return {
-        "consensus_response": winner_resp.get("response_text", "") if winner_resp else "",
-        "consensus_score": float(winner_resp.get("final_score", 0.0)) if winner_resp else 0.0,
+        "consensus_response": winner_resp.get("response_text", "")
+        if winner_resp
+        else "",
+        "consensus_score": float(winner_resp.get("final_score", 0.0))
+        if winner_resp
+        else 0.0,
         "winning_muse": winner_name,
         "cost": total_cost,
         "latency_ms": max_latency,
@@ -1893,7 +2185,9 @@ def _debate_refinement_prompt(
         text = str(response.get("response_text") or "").strip()
         if text:
             others.append(f"{name}: {text}")
-    context = "\n\n".join(others) if others else "No other round-1 responses were available."
+    context = (
+        "\n\n".join(others) if others else "No other round-1 responses were available."
+    )
     return (
         "Original consultation prompt:\n"
         f"{prompt}\n\n"
@@ -1916,7 +2210,8 @@ def _compute_quorum(all_responses: Dict[str, Dict], quorum: float) -> Dict[str, 
     successes = {
         name: str(resp.get("response_text") or "").strip()
         for name, resp in all_responses.items()
-        if resp.get("status") == "success" and str(resp.get("response_text") or "").strip()
+        if resp.get("status") == "success"
+        and str(resp.get("response_text") or "").strip()
     }
     if len(successes) < 2:
         return {
@@ -1958,7 +2253,9 @@ def _compute_quorum(all_responses: Dict[str, Dict], quorum: float) -> Dict[str, 
 
     if quorum_reached and len(quorum_muses) > 1:
         component_scores = [
-            similarity_pairs.get(f"{left}:{right}", similarity_pairs.get(f"{right}:{left}", 0.0))
+            similarity_pairs.get(
+                f"{left}:{right}", similarity_pairs.get(f"{right}:{left}", 0.0)
+            )
             for left, right in combinations(quorum_muses, 2)
         ]
         consensus_score = max(component_scores) if component_scores else best_score
@@ -1981,10 +2278,7 @@ def _selection_cache_tag(selection: Optional[Dict[str, Optional[str]]]) -> str:
     """
     if not selection:
         return ""
-    parts = sorted(
-        f"{name}={override or ''}"
-        for name, override in selection.items()
-    )
+    parts = sorted(f"{name}={override or ''}" for name, override in selection.items())
     return "|" + ",".join(parts)
 
 
@@ -2077,7 +2371,9 @@ def _is_reasoning_variant(model_id: str) -> bool:
     return lower.endswith("-reasoning") and not lower.endswith("-non-reasoning")
 
 
-async def _ranked_candidates(conn, registry_provider: str, prefer: list[str]) -> list[str]:
+async def _ranked_candidates(
+    conn, registry_provider: str, prefer: list[str]
+) -> list[str]:
     """Return model_ids ordered by selection priority (best first).
 
     Two-stage policy:
@@ -2124,13 +2420,15 @@ async def _ranked_candidates(conn, registry_provider: str, prefer: list[str]) ->
         # (e.g. groq's whisper variants in the llama family slot).
         if family_rank is None and not r["arena_score"]:
             continue
-        annotated.append({
-            "mid": mid,
-            "family_rank": family_rank if family_rank is not None else len(prefer),
-            "version": _extract_version(mid),
-            "arena": float(r["arena_score"] or 0),
-            "synced": r["last_synced"].timestamp() if r["last_synced"] else 0,
-        })
+        annotated.append(
+            {
+                "mid": mid,
+                "family_rank": family_rank if family_rank is not None else len(prefer),
+                "version": _extract_version(mid),
+                "arena": float(r["arena_score"] or 0),
+                "synced": r["last_synced"].timestamp() if r["last_synced"] else 0,
+            }
+        )
     if not annotated:
         return []
 
@@ -2156,7 +2454,8 @@ async def _ranked_candidates(conn, registry_provider: str, prefer: list[str]) ->
     risers: list[dict] = []
     if arena_top is not None:
         risers = [
-            a for a in annotated
+            a
+            for a in annotated
             if a["family_rank"] == arena_top["family_rank"]
             and a["version"] > arena_top["version"]
             and a["mid"] != arena_top["mid"]
@@ -2169,9 +2468,12 @@ async def _ranked_candidates(conn, registry_provider: str, prefer: list[str]) ->
 
     riser_ids = {a["mid"] for a in risers}
     others = sorted(
-        (a for a in annotated
-         if (arena_top is None or a["mid"] != arena_top["mid"])
-         and a["mid"] not in riser_ids),
+        (
+            a
+            for a in annotated
+            if (arena_top is None or a["mid"] != arena_top["mid"])
+            and a["mid"] not in riser_ids
+        ),
         key=_internal_key,
     )
 
@@ -2187,8 +2489,13 @@ async def _ranked_candidates(conn, registry_provider: str, prefer: list[str]) ->
     return ranked
 
 
-async def _probe_model(client: httpx.AsyncClient, provider_cfg: dict,
-                       model_id: str, api_key: str, timeout: int = 15) -> bool:
+async def _probe_model(
+    client: httpx.AsyncClient,
+    provider_cfg: dict,
+    model_id: str,
+    api_key: str,
+    timeout: int = 15,
+) -> bool:
     """Probe model_id with a tiny generate call; True iff HTTP 200.
 
     Probe bodies match the shape of _call_provider_worker so a passing probe

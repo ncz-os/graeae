@@ -61,6 +61,57 @@ class _FakeQuality:
         return {}
 
 
+class _FakeAcquire:
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeRegistryConn:
+    def __init__(self):
+        self.calls = 0
+        self.registry_names: list[tuple[str, ...]] = []
+
+    async def fetch(self, query, registry_names):
+        del query
+        self.calls += 1
+        self.registry_names.append(tuple(registry_names))
+        if self.calls == 1:
+            return [
+                {
+                    "provider": "beta",
+                    "model_id": "beta-registry-1",
+                    "graeae_weight": 0.99,
+                },
+                {
+                    "provider": "alpha",
+                    "model_id": "alpha-registry-1",
+                    "graeae_weight": 0.50,
+                },
+            ]
+        return [
+            {
+                "provider": "alpha",
+                "model_id": "alpha-registry-2",
+                "graeae_weight": 0.99,
+            },
+            {"provider": "beta", "model_id": "beta-registry-2", "graeae_weight": 0.50},
+        ]
+
+
+class _FakeRegistryPool:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def acquire(self):
+        return _FakeAcquire(self.conn)
+
+
 def _provider_config(
     model: str,
     weight: float,
@@ -89,30 +140,38 @@ def _build_engine(
     from mnemos.domain.graeae.engine import GraeaeEngine
 
     monkeypatch.setattr(lc, "_pool", None)
-    monkeypatch.setattr(graeae_engine, "get_elo_weights", lambda force_refresh=False: None)
+    monkeypatch.setattr(
+        graeae_engine, "get_elo_weights", lambda force_refresh=False: None
+    )
     engine = GraeaeEngine()
-    engine.providers = providers if providers is not None else {
-        "alpha": _provider_config("alpha-model", 0.95),
-        "beta": _provider_config("beta-model", 0.85),
-        "gamma": _provider_config("gamma-model", 0.75),
-        "delta": _provider_config("delta-model", 0.65),
-    }
+    engine.providers = (
+        providers
+        if providers is not None
+        else {
+            "alpha": _provider_config("alpha-model", 0.95),
+            "beta": _provider_config("beta-model", 0.85),
+            "gamma": _provider_config("gamma-model", 0.75),
+            "delta": _provider_config("delta-model", 0.65),
+        }
+    )
     engine._circuit_breakers = _AllowAll()
     engine._rate_limiters = _AllowAll()
     engine._concurrency = _FakeConcurrency()
-    engine._quality = _FakeQuality({
-        name: cfg["weight"] for name, cfg in engine.providers.items()
-    })
+    engine._quality = _FakeQuality(
+        {name: cfg["weight"] for name, cfg in engine.providers.items()}
+    )
     calls: list[dict] = []
 
     async def _fake_provider_worker(request):
         provider_name = request.provider
         prompt = request.params["prompt"]
-        calls.append({
-            "provider": provider_name,
-            "prompt": prompt,
-            "model_override": request.model,
-        })
+        calls.append(
+            {
+                "provider": provider_name,
+                "prompt": prompt,
+                "model_override": request.model,
+            }
+        )
         if callable(responses):
             text = responses(provider_name, prompt)
         elif responses is not None:
@@ -277,16 +336,56 @@ async def test_single_mode_calls_exactly_one_muse(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ranked_lineup_caches_registry_query_until_ttl_expires(monkeypatch):
+    import mnemos.core.lifecycle as lc
+    import mnemos.domain.graeae.engine as graeae_engine
+
+    monkeypatch.setenv("MNEMOS_GRAEAE_RANKED_LINEUP_TTL_SECONDS", "1")
+    now = 100.0
+    monkeypatch.setattr(graeae_engine.time, "monotonic", lambda: now)
+    engine, _calls = _build_engine(monkeypatch)
+    conn = _FakeRegistryConn()
+    monkeypatch.setattr(lc, "_pool", _FakeRegistryPool(conn))
+
+    first = await engine._ranked_lineup(
+        task_type="reasoning",
+        limit=2,
+        selection={"alpha": None, "beta": None},
+    )
+    second = await engine._ranked_lineup(
+        task_type="reasoning",
+        limit=2,
+        selection={"alpha": "alpha-override", "beta": None},
+    )
+    now = 102.0
+    third = await engine._ranked_lineup(
+        task_type="reasoning",
+        limit=2,
+        selection={"alpha": None, "beta": None},
+    )
+
+    assert conn.calls == 2
+    assert conn.registry_names == [("alpha", "beta"), ("alpha", "beta")]
+    assert first == {"beta": "beta-registry-1", "alpha": "alpha-registry-1"}
+    assert second == {"beta": "beta-registry-1", "alpha": "alpha-override"}
+    assert third == {"alpha": "alpha-registry-2", "beta": "beta-registry-2"}
+
+
+@pytest.mark.asyncio
 async def test_debate_mode_runs_three_muses_for_two_rounds(monkeypatch):
     engine, calls = _build_engine(monkeypatch)
 
-    result = await engine.consult("design the cache", "architecture_design", mode="debate")
+    result = await engine.consult(
+        "design the cache", "architecture_design", mode="debate"
+    )
 
     assert len(calls) == 6
     assert [call["provider"] for call in calls[:3]] == ["alpha", "beta", "gamma"]
     assert [call["provider"] for call in calls[3:]] == ["alpha", "beta", "gamma"]
     assert all(call["prompt"] == "design the cache" for call in calls[:3])
-    assert all("Round 1 responses from the other muses" in call["prompt"] for call in calls[3:])
+    assert all(
+        "Round 1 responses from the other muses" in call["prompt"] for call in calls[3:]
+    )
     assert set(result["round_1"]) == {"alpha", "beta", "gamma"}
     assert set(result["round_2"]) == {"alpha", "beta", "gamma"}
     assert set(result["all_responses"]) == {"alpha", "beta", "gamma"}
@@ -331,23 +430,30 @@ async def test_majority_mode_reports_quorum_not_reached(monkeypatch):
 # Regression for the defect where `mode` was only a quorum label, so an
 # `external` consult still queried local-GPU muses (and vice versa).
 
+
 def _scoped_providers() -> dict[str, dict]:
     return {
         # public cloud FQDNs -> external by host inference
         "cloud_openai": _provider_config(
-            "gpt", 0.90, url="https://api.openai.com/v1/chat/completions"),
+            "gpt", 0.90, url="https://api.openai.com/v1/chat/completions"
+        ),
         "cloud_xai": _provider_config(
-            "grok", 0.86, url="https://api.x.ai/v1/chat/completions"),
+            "grok", 0.86, url="https://api.x.ai/v1/chat/completions"
+        ),
         # LAN GPU servers (RFC-1918) -> local by host inference
         "lan_cerberus": _provider_config(
-            "gemma", 0.70, url="http://192.168.207.96:8080/v1/chat/completions"),
+            "gemma", 0.70, url="http://192.168.207.96:8080/v1/chat/completions"
+        ),
         "lan_hydra": _provider_config(
-            "qwen", 0.72, url="http://192.168.207.78:8080/v1/chat/completions"),
+            "qwen", 0.72, url="http://192.168.207.78:8080/v1/chat/completions"
+        ),
         # OAuth shim on loopback, but proxies a CLOUD model -> explicit scope wins
         "shim_openai": _provider_config(
-            "gpt-oauth", 0.88,
+            "gpt-oauth",
+            0.88,
             url="http://127.0.0.1:5079/openai/v1/chat/completions",
-            scope="external"),
+            scope="external",
+        ),
     }
 
 
@@ -405,9 +511,11 @@ async def test_all_mode_queries_every_muse_regardless_of_scope(monkeypatch):
 async def test_external_mode_with_no_external_muses_errors(monkeypatch):
     local_only = {
         "lan_cerberus": _provider_config(
-            "gemma", 0.70, url="http://192.168.207.96:8080/v1/chat/completions"),
+            "gemma", 0.70, url="http://192.168.207.96:8080/v1/chat/completions"
+        ),
         "lan_hydra": _provider_config(
-            "qwen", 0.72, url="http://192.168.207.78:8080/v1/chat/completions"),
+            "qwen", 0.72, url="http://192.168.207.78:8080/v1/chat/completions"
+        ),
     }
     engine, calls = _build_engine(monkeypatch, providers=local_only)
 
