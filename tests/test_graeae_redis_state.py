@@ -57,22 +57,28 @@ async def test_redis_response_cache_batch_lookup_uses_mget():
     )
     cache = RedisResponseCache(redis)
 
-    found = await cache.get_many([
-        ("p1", "reasoning", "m1"),
-        ("p2", "reasoning", "m2"),
-    ])
+    found = await cache.get_many(
+        [
+            ("p1", "reasoning", "m1"),
+            ("p2", "reasoning", "m2"),
+        ]
+    )
 
     assert found == {("p1", "reasoning", "m1"): {"a": 1}}
     redis.mget.assert_awaited_once()
-    assert all(key.startswith("mnemos:graeae:cache:") for key in redis.mget.await_args.args[0])
+    assert all(
+        key.startswith("mnemos:graeae:cache:") for key in redis.mget.await_args.args[0]
+    )
 
 
 @pytest.mark.asyncio
 async def test_redis_quality_tracker_updates_provider_zset_with_lua():
-    redis = SimpleNamespace(eval=AsyncMock(return_value=[0.8, 120.0]), zscore=AsyncMock(return_value=0.8))
+    redis = SimpleNamespace(
+        eval=AsyncMock(return_value=[0.8, 120.0]), zscore=AsyncMock(return_value=0.8)
+    )
     tracker = RedisQualityTracker(redis, {"openai": 0.9})
 
-    await tracker.record_success("openai", 120)
+    recorded_weight = await tracker.record_success("openai", 120)
     weight = await tracker.dynamic_weight("openai")
 
     args = redis.eval.await_args.args
@@ -81,7 +87,10 @@ async def test_redis_quality_tracker_updates_provider_zset_with_lua():
     assert args[2] == "mnemos:graeae:quality:openai"
     assert args[3:] == (1.0, 120, 0.2, 0.9)
     assert "ZADD" in args[0]
-    redis.zscore.assert_awaited_once_with("mnemos:graeae:quality:openai", "success_ewma")
+    redis.zscore.assert_awaited_once_with(
+        "mnemos:graeae:quality:openai", "success_ewma"
+    )
+    assert recorded_weight == 0.81
     assert weight == 0.81
 
 
@@ -89,5 +98,10 @@ def test_graeae_state_factories_select_redis_when_configured():
     redis = SimpleNamespace()
     settings = _settings()
 
-    assert isinstance(make_response_cache(settings, redis_client=redis), RedisResponseCache)
-    assert isinstance(make_quality_tracker(settings, {"openai": 0.9}, redis_client=redis), RedisQualityTracker)
+    assert isinstance(
+        make_response_cache(settings, redis_client=redis), RedisResponseCache
+    )
+    assert isinstance(
+        make_quality_tracker(settings, {"openai": 0.9}, redis_client=redis),
+        RedisQualityTracker,
+    )

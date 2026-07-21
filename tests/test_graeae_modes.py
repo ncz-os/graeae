@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Callable
 
 import pytest
@@ -110,6 +111,78 @@ class _FakeRegistryPool:
 
     def acquire(self):
         return _FakeAcquire(self.conn)
+
+
+class _AsyncCallProbe:
+    def __init__(self):
+        self.calls: list[str] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def __call__(self, name: str, result=True):
+        self.calls.append(name)
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        await asyncio.sleep(0.01)
+        self.in_flight -= 1
+        return result
+
+
+class _ParallelBreaker:
+    def __init__(self):
+        self.allowed = _AsyncCallProbe()
+        self.successes = _AsyncCallProbe()
+        self.failures = _AsyncCallProbe()
+
+    async def is_allowed(self, name: str) -> bool:
+        return await self.allowed(name)
+
+    async def record_success(self, name: str) -> None:
+        await self.successes(name, None)
+
+    async def record_failure(self, name: str) -> None:
+        await self.failures(name, None)
+
+    def status(self) -> dict:
+        return {}
+
+
+class _ParallelConcurrency:
+    def __init__(self):
+        self.acquired = _AsyncCallProbe()
+        self.released = _AsyncCallProbe()
+
+    async def acquire(self, name: str) -> bool:
+        return await self.acquired(name)
+
+    async def release(self, name: str) -> None:
+        await self.released(name, None)
+
+    def status(self) -> dict:
+        return {}
+
+
+class _ParallelQuality:
+    def __init__(self, weights: dict[str, float]):
+        self.weights = weights
+        self.successes = _AsyncCallProbe()
+        self.failures = _AsyncCallProbe()
+        self.dynamic_weight_calls: list[str] = []
+
+    async def record_success(self, name: str, latency: int) -> float:
+        del latency
+        await self.successes(name, None)
+        return self.weights[name]
+
+    async def record_failure(self, name: str) -> None:
+        await self.failures(name, None)
+
+    async def dynamic_weight(self, name: str) -> float:
+        self.dynamic_weight_calls.append(name)
+        return self.weights[name]
+
+    def status(self) -> dict:
+        return {}
 
 
 def _provider_config(
@@ -505,6 +578,39 @@ async def test_all_mode_queries_every_muse_regardless_of_scope(monkeypatch):
 
     # `all` keeps the full lineup; cancelled muses still appear as keys.
     assert set(result["all_responses"]) == set(_scoped_providers())
+
+
+@pytest.mark.asyncio
+async def test_consult_runs_independent_provider_state_checks_in_parallel(monkeypatch):
+    engine, calls = _build_engine(monkeypatch)
+    breaker = _ParallelBreaker()
+    rate_limiter = _ParallelBreaker()
+    concurrency = _ParallelConcurrency()
+    quality = _ParallelQuality(
+        {name: cfg["weight"] for name, cfg in engine.providers.items()}
+    )
+    engine._circuit_breakers = breaker
+    engine._rate_limiters = rate_limiter
+    engine._concurrency = concurrency
+    engine._quality = quality
+
+    result = await engine.consult("parallel state", "reasoning", mode="all")
+
+    provider_names = list(engine.providers)
+    assert [call["provider"] for call in calls] == provider_names
+    assert list(result["all_responses"]) == provider_names
+    assert breaker.allowed.calls == provider_names
+    assert rate_limiter.allowed.calls == provider_names
+    assert concurrency.acquired.calls == provider_names
+    assert concurrency.released.calls == provider_names
+    assert breaker.successes.calls == provider_names
+    assert quality.successes.calls == provider_names
+    assert breaker.allowed.max_in_flight > 1
+    assert rate_limiter.allowed.max_in_flight > 1
+    assert concurrency.acquired.max_in_flight > 1
+    assert concurrency.released.max_in_flight > 1
+    assert quality.successes.max_in_flight > 1
+    assert quality.dynamic_weight_calls == []
 
 
 @pytest.mark.asyncio

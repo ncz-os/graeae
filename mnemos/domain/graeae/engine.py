@@ -1023,17 +1023,20 @@ class GraeaeEngine:
         #   • circuit-open (repeated recent failures)
         #   • rate-limited (RPM window exhausted)
         #   • saturated (all concurrency slots occupied)
-        active: list[str] = []
-        skipped: list[str] = []
-        for name in candidate_providers:
+        async def _check_provider_eligibility(name: str) -> tuple[str, bool]:
             if not await call_maybe_async(self._circuit_breakers.is_allowed, name):
-                skipped.append(name)
-            elif not await call_maybe_async(self._rate_limiters.is_allowed, name):
-                skipped.append(name)
-            elif not await call_maybe_async(concurrency.acquire, name):
-                skipped.append(name)
-            else:
-                active.append(name)
+                return name, False
+            if not await call_maybe_async(self._rate_limiters.is_allowed, name):
+                return name, False
+            if not await call_maybe_async(concurrency.acquire, name):
+                return name, False
+            return name, True
+
+        eligibility = await asyncio.gather(
+            *(_check_provider_eligibility(name) for name in candidate_providers)
+        )
+        active = [name for name, is_active in eligibility if is_active]
+        skipped = [name for name, is_active in eligibility if not is_active]
 
         if skipped:
             logger.info(f"[GRAEAE] skipped providers: {skipped}")
@@ -1179,18 +1182,24 @@ class GraeaeEngine:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
         finally:
-            for name in active:
+
+            async def _release_provider_slot(name: str) -> None:
                 await call_maybe_async(concurrency.release, name)
+
+            await asyncio.gather(*(_release_provider_slot(name) for name in active))
 
         all_responses: Dict = {}
 
-        for name, result in zip(active, results):
+        async def _record_provider_result(
+            name: str,
+            result: Any,
+        ) -> tuple[str, Dict]:
             if isinstance(result, Exception):
                 await call_maybe_async(self._circuit_breakers.record_failure, name)
                 await call_maybe_async(self._quality.record_failure, name)
                 err_msg = f"{type(result).__name__}: {str(result)[:400]}"
                 logger.warning(f"[GRAEAE] muse {name} failed: {err_msg}")
-                all_responses[name] = {
+                return name, {
                     "status": "error",
                     "response_text": "",
                     "error": err_msg,
@@ -1198,15 +1207,27 @@ class GraeaeEngine:
                     "model_id": self.providers[name]["model"],
                     "final_score": 0.0,
                 }
-            else:
-                await call_maybe_async(self._circuit_breakers.record_success, name)
-                await call_maybe_async(
-                    self._quality.record_success, name, result.get("latency_ms", 0)
+            await call_maybe_async(self._circuit_breakers.record_success, name)
+            recorded_weight = await call_maybe_async(
+                self._quality.record_success,
+                name,
+                result.get("latency_ms", 0),
+            )
+            if recorded_weight is None:
+                recorded_weight = await call_maybe_async(
+                    self._quality.dynamic_weight,
+                    name,
                 )
-                result["final_score"] = await call_maybe_async(
-                    self._quality.dynamic_weight, name
-                )
-                all_responses[name] = result
+            result["final_score"] = recorded_weight
+            return name, result
+
+        recorded_responses = await asyncio.gather(
+            *(
+                _record_provider_result(name, result)
+                for name, result in zip(active, results)
+            )
+        )
+        all_responses.update(recorded_responses)
 
         for name in skipped:
             all_responses[name] = _unavailable(self.providers[name]["model"])
