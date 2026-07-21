@@ -88,7 +88,11 @@ class ProviderQuality:
 
     def avg_latency_ms(self) -> int:
         with self._lock:
-            return int(sum(self._latencies) / len(self._latencies)) if self._latencies else 0
+            return (
+                int(sum(self._latencies) / len(self._latencies))
+                if self._latencies
+                else 0
+            )
 
 
 class QualityTracker:
@@ -153,9 +157,15 @@ class RedisQualityTracker:
     def _key(self, provider: str) -> str:
         return f"{self.key_prefix}{provider}"
 
-    async def _record(self, provider: str, *, outcome: float, latency_ms: int) -> None:
+    async def _record(
+        self,
+        provider: str,
+        *,
+        outcome: float,
+        latency_ms: int,
+    ) -> float | None:
         if provider not in self.provider_weights:
-            return
+            return None
         base_weight = float(self.provider_weights[provider])
         result = await self.redis.eval(
             _REDIS_QUALITY_EWMA_LUA,
@@ -166,16 +176,24 @@ class RedisQualityTracker:
             float(self.alpha),
             base_weight,
         )
-        success_ewma = float(result[0]) if isinstance(result, (list, tuple)) else float(result)
-        latency_ewma = float(result[1]) if isinstance(result, (list, tuple)) and len(result) > 1 else 0.0
+        success_ewma = (
+            float(result[0]) if isinstance(result, (list, tuple)) else float(result)
+        )
+        latency_ewma = (
+            float(result[1])
+            if isinstance(result, (list, tuple)) and len(result) > 1
+            else 0.0
+        )
+        dynamic_weight = round(base_weight * (0.5 + 0.5 * success_ewma), 4)
         self._last_status[provider] = {
-            "dynamic_weight": round(base_weight * (0.5 + 0.5 * success_ewma), 4),
+            "dynamic_weight": dynamic_weight,
             "base_weight": base_weight,
             "avg_latency_ms": int(latency_ewma),
         }
+        return dynamic_weight
 
-    async def record_success(self, provider: str, latency_ms: int) -> None:
-        await self._record(provider, outcome=1.0, latency_ms=latency_ms)
+    async def record_success(self, provider: str, latency_ms: int) -> float | None:
+        return await self._record(provider, outcome=1.0, latency_ms=latency_ms)
 
     async def record_failure(self, provider: str) -> None:
         await self._record(provider, outcome=0.0, latency_ms=-1)
@@ -208,7 +226,9 @@ def make_quality_tracker(
     redis_client: Any | None = None,
 ) -> QualityTracker | RedisQualityTracker:
     if _redis_requested(settings):
-        client = redis_client if redis_client is not None else _get_lifecycle_redis_client()
+        client = (
+            redis_client if redis_client is not None else _get_lifecycle_redis_client()
+        )
         if client is not None:
             return RedisQualityTracker(client, provider_weights)
         _warn_fallback(settings, "Redis quality tracker requested but unavailable")
