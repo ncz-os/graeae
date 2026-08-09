@@ -9,6 +9,15 @@ description = "GRAEAE multi-muse consult engine — extracted from mnemos monore
 requires-python = ">=3.11"
 dependencies = ["mnemos-core", "httpx"]
 
+[project.optional-dependencies]
+test = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+]
+
 [tool.setuptools.packages.find]
 include = ["mnemos*"]
 namespaces = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

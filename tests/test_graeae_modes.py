@@ -477,7 +477,15 @@ async def test_majority_mode_reports_quorum_reached(monkeypatch):
 
     result = await engine.consult("approve?", "architecture_design", mode="majority")
 
-    assert [call["provider"] for call in calls] == ["alpha", "beta", "gamma"]
+    # Majority intentionally uses up to five ranked muses. This fixture has four,
+    # so the dissenting fourth response participates while the three matching
+    # responses still satisfy the 66% quorum.
+    assert [call["provider"] for call in calls] == [
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+    ]
     assert result["quorum_reached"] is True
     assert result["consensus_score"] >= result["quorum_threshold"]
 

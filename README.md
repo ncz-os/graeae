@@ -30,6 +30,20 @@ GRAEAE is bundled in the Mnemos umbrella image (`ghcr.io/ncz-os/mnemos`) and the
 distribution is present, `mnemos-core` mounts the GRAEAE routes automatically;
 when absent, core boots without them.
 
+## Development
+
+GRAEAE and core contribute separate portions of the same PEP 420 `mnemos`
+namespace. For a split-repository checkout, install both distributions editably
+instead of setting `PYTHONPATH`:
+
+```bash
+git clone https://gitlab.com/ncz-os/mnemos.git ../mnemos-core
+python -m pip install -e ../mnemos-core -e ".[test]"
+pytest
+```
+
+The GitLab test job uses this same setup from a clean checkout.
+
 ## Operator Guardrails
 
 Gateway calls are bounded before GRAEAE dispatches to upstream LLM providers:

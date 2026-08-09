@@ -166,7 +166,9 @@ class ProviderQuality:
             # Mark as dirty for later flush
             self._mark_dirty()
 
-    def record_failure(self, provider: str, classification: Classification = Classification.OTHER_ERROR) -> None:
+    def record_failure(
+        self, classification: Classification = Classification.OTHER_ERROR
+    ) -> None:
         with self._lock:
             self._last_checked = datetime.now().timestamp()
             self._classification = classification
@@ -277,7 +279,7 @@ class QualityTracker:
 
     def record_failure(self, provider: str, classification: Classification = Classification.OTHER_ERROR) -> None:
         if t := self._get(provider):
-            t.record_failure(provider, classification)
+            t.record_failure(classification)
 
     def dynamic_weight(self, provider: str) -> float:
         if t := self._get(provider):
