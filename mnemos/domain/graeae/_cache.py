@@ -23,12 +23,6 @@ import time
 from collections import OrderedDict
 from typing import Any
 
-from mnemos.core.resilience import (
-    _get_lifecycle_redis_client,
-    _redis_requested,
-    _warn_fallback,
-)
-
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TTL = 3600   # seconds
@@ -157,11 +151,6 @@ def make_response_cache(
     max_entries: int = _MAX_ENTRIES,
     redis_client: Any | None = None,
 ) -> ResponseCache | RedisResponseCache:
-    if _redis_requested(settings):
-        client = redis_client if redis_client is not None else _get_lifecycle_redis_client()
-        if client is not None:
-            return RedisResponseCache(client, ttl_seconds=ttl_seconds)
-        _warn_fallback(settings, "Redis response cache requested but unavailable")
-    else:
-        _warn_fallback(settings, "Redis not configured")
+    if redis_client is not None:
+        return RedisResponseCache(redis_client, ttl_seconds=ttl_seconds)
     return ResponseCache(ttl_seconds=ttl_seconds, max_entries=max_entries)
