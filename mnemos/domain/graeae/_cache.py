@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Response cache backends for the GRAEAE engine.
 
 Per-process LRU cache keyed on sha256(task_type + normalized_prompt).
@@ -15,6 +13,9 @@ Key design choices:
   minute-to-minute; caching them avoids redundant API spend.
 - LRU eviction at max_entries to bound memory usage.
 """
+
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -23,15 +24,9 @@ import time
 from collections import OrderedDict
 from typing import Any
 
-from mnemos.core.resilience import (
-    _get_lifecycle_redis_client,
-    _redis_requested,
-    _warn_fallback,
-)
-
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TTL = 3600   # seconds
+_DEFAULT_TTL = 3600  # seconds
 _MAX_ENTRIES = 500
 _REDIS_KEY_PREFIX = "mnemos:graeae:cache:"
 
@@ -39,7 +34,9 @@ _REDIS_KEY_PREFIX = "mnemos:graeae:cache:"
 class ResponseCache:
     """Thread-safe LRU cache for GRAEAE consensus responses."""
 
-    def __init__(self, ttl_seconds: int = _DEFAULT_TTL, max_entries: int = _MAX_ENTRIES):
+    def __init__(
+        self, ttl_seconds: int = _DEFAULT_TTL, max_entries: int = _MAX_ENTRIES
+    ):
         self.ttl = ttl_seconds
         self.max_entries = max_entries
         self._store: OrderedDict[str, tuple[float, Any]] = OrderedDict()
@@ -116,7 +113,9 @@ class RedisResponseCache:
         self._hits += 1
         return json.loads(raw)
 
-    async def set(self, prompt: str, task_type: str, value: Any, model: str = "") -> None:
+    async def set(
+        self, prompt: str, task_type: str, value: Any, model: str = ""
+    ) -> None:
         payload = json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
         await self.redis.set(self._key(prompt, task_type, model), payload, ex=self.ttl)
 
@@ -126,7 +125,9 @@ class RedisResponseCache:
     ) -> dict[tuple[str, str, str], Any]:
         if not items:
             return {}
-        keys = [self._key(prompt, task_type, model) for prompt, task_type, model in items]
+        keys = [
+            self._key(prompt, task_type, model) for prompt, task_type, model in items
+        ]
         values = await self.redis.mget(keys)
         found: dict[tuple[str, str, str], Any] = {}
         for item, raw in zip(items, values):
@@ -157,11 +158,6 @@ def make_response_cache(
     max_entries: int = _MAX_ENTRIES,
     redis_client: Any | None = None,
 ) -> ResponseCache | RedisResponseCache:
-    if _redis_requested(settings):
-        client = redis_client if redis_client is not None else _get_lifecycle_redis_client()
-        if client is not None:
-            return RedisResponseCache(client, ttl_seconds=ttl_seconds)
-        _warn_fallback(settings, "Redis response cache requested but unavailable")
-    else:
-        _warn_fallback(settings, "Redis not configured")
+    if redis_client is not None:
+        return RedisResponseCache(redis_client, ttl_seconds=ttl_seconds)
     return ResponseCache(ttl_seconds=ttl_seconds, max_entries=max_entries)
