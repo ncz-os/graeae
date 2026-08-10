@@ -8,8 +8,6 @@ import hashlib
 import hmac
 import logging
 import os
-import time
-from collections import defaultdict, deque
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -17,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import require_consultations_backend
 from mnemos.core.rate_limit import limiter
+from mnemos.core.resilience import _get_lifecycle_redis_client
 from mnemos.core.security import is_root, scope_namespace
 from mnemos.domain.graeae.engine import _REGISTRY_MAP
 from mnemos.domain.models import (
@@ -120,9 +119,42 @@ _MODE_COST_WEIGHT = {
     "debate": 8.0,
 }
 _QUOTA_WINDOW_SECONDS = 60.0
-# user_id -> deque[(monotonic_ts, weight)]. Bounded by active principals;
-# empty buckets are pruned opportunistically below.
-_consult_usage: dict[str, deque] = defaultdict(deque)
+_QUOTA_KEY_PREFIX = "mnemos:graeae:consult-quota:"
+
+_CONSULT_QUOTA_LUA = """
+local key = KEYS[1]
+local sequence_key = KEYS[2]
+local weight = tonumber(ARGV[1])
+local quota = tonumber(ARGV[2])
+local window_ms = tonumber(ARGV[3])
+local redis_time = redis.call('TIME')
+local now_ms = (tonumber(redis_time[1]) * 1000) + math.floor(tonumber(redis_time[2]) / 1000)
+local cutoff = now_ms - window_ms
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+local used = 0
+local members = redis.call('ZRANGE', key, 0, -1)
+for _, member in ipairs(members) do
+  local separator = string.find(member, ':', 1, true)
+  used = used + tonumber(string.sub(member, 1, separator - 1))
+end
+
+if used + weight > quota then
+  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  local retry_ms = window_ms
+  if #oldest == 2 then
+    retry_ms = math.max(1, tonumber(oldest[2]) + window_ms - now_ms)
+  end
+  return {0, tostring(used), retry_ms}
+end
+
+local sequence = redis.call('INCR', sequence_key)
+local member = tostring(weight) .. ':' .. tostring(now_ms) .. ':' .. tostring(sequence)
+redis.call('ZADD', key, now_ms, member)
+redis.call('PEXPIRE', key, window_ms)
+redis.call('PEXPIRE', sequence_key, window_ms)
+return {1, tostring(used + weight), 0}
+"""
 
 
 def _consult_quota_per_min() -> float:
@@ -132,25 +164,43 @@ def _consult_quota_per_min() -> float:
         return 20.0
 
 
-def _enforce_consult_quota(user_id: str, mode: str) -> None:
-    """Cost-weighted per-principal quota. Raises 429 when the window is full.
-
-    Synchronous (no awaits) so the read-modify-write of the bucket is atomic
-    within the event loop; keying is the SERVER-derived user_id, never a
-    client-supplied value.
-    """
+async def _enforce_consult_quota(user_id: str, mode: str) -> None:
+    """Atomically enforce the shared, cost-weighted per-principal quota."""
     quota = _consult_quota_per_min()
     if quota <= 0:
         return
     weight = _MODE_COST_WEIGHT.get((mode or "auto").lower(), 2.0)
-    now = time.monotonic()
-    cutoff = now - _QUOTA_WINDOW_SECONDS
-    bucket = _consult_usage[str(user_id or "anonymous")]
-    while bucket and bucket[0][0] < cutoff:
-        bucket.popleft()
-    used = sum(w for _, w in bucket)
-    if used + weight > quota:
-        retry = max(1, int(bucket[0][0] + _QUOTA_WINDOW_SECONDS - now)) if bucket else int(_QUOTA_WINDOW_SECONDS)
+    redis = _get_lifecycle_redis_client()
+    if redis is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Shared consultation quota storage is unavailable.",
+        )
+
+    principal = hashlib.sha256(str(user_id or "anonymous").encode()).hexdigest()
+    key = f"{_QUOTA_KEY_PREFIX}{principal}"
+    try:
+        allowed, used_raw, retry_ms = await redis.eval(
+            _CONSULT_QUOTA_LUA,
+            2,
+            key,
+            f"{key}:sequence",
+            weight,
+            quota,
+            int(_QUOTA_WINDOW_SECONDS * 1000),
+        )
+    except Exception as exc:
+        logger.error("[CONSULTATION] shared quota check failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Shared consultation quota storage is unavailable.",
+        ) from exc
+
+    if not int(allowed):
+        if isinstance(used_raw, bytes):
+            used_raw = used_raw.decode()
+        used = float(used_raw)
+        retry = max(1, (int(retry_ms) + 999) // 1000)
         raise HTTPException(
             status_code=429,
             detail=(
@@ -159,9 +209,6 @@ def _enforce_consult_quota(user_id: str, mode: str) -> None:
             ),
             headers={"Retry-After": str(retry)},
         )
-    bucket.append((now, weight))
-    if not bucket:  # pragma: no cover - defensive prune
-        _consult_usage.pop(str(user_id or "anonymous"), None)
 
 
 def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
@@ -451,7 +498,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
     # SECURITY (review #12): cost-weighted per-principal quota, BEFORE any
     # provider fan-out, so a single caller cannot turn 60 req/min of
     # mode=all/debate into a financial DoS.
-    _enforce_consult_quota(user.user_id, body.mode)
+    await _enforce_consult_quota(user.user_id, body.mode)
     try:
         backend = require_consultations_backend()
         from mnemos.domain.graeae.engine import get_graeae_engine
@@ -486,8 +533,17 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                     resp["truncated"] = original_len > body.limit_chars
 
         if body.format == "best" and result.get("all_responses"):
-            best = max(result["all_responses"].items(), key=lambda x: x[1].get("final_score", 0))
-            result["all_responses"] = {best[0]: best[1]}
+            successful = [
+                item
+                for item in result["all_responses"].items()
+                if item[1].get("status") == "success"
+            ]
+            best = max(
+                successful,
+                key=lambda item: item[1].get("final_score", 0),
+                default=None,
+            )
+            result["all_responses"] = {best[0]: best[1]} if best else {}
 
         consultation_id = None
         memory_ids = _extract_memory_ids(result)
@@ -540,7 +596,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                         # verify() below will (correctly) report the chain unsigned.
                         genesis_hash=audit_genesis_hash(),
                     )
-                    if backend.supports_webhooks:
+                    if getattr(backend, "supports_webhooks", False):
                         delivery_ids = await backend.webhooks.dispatch_event(
                             tx,
                             "consultation.completed",

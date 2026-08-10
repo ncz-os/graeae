@@ -614,6 +614,42 @@ async def test_consult_runs_independent_provider_state_checks_in_parallel(monkey
 
 
 @pytest.mark.asyncio
+async def test_quorum_cancelled_provider_does_not_record_success(monkeypatch):
+    engine, _calls = _build_engine(monkeypatch)
+    quality = _ParallelQuality(
+        {name: cfg["weight"] for name, cfg in engine.providers.items()}
+    )
+    breaker = _ParallelBreaker()
+    engine._quality = quality
+    engine._circuit_breakers = breaker
+
+    original_worker = engine.provider_worker
+
+    async def _worker(request):
+        if request.provider == "delta":
+            await asyncio.Event().wait()
+        return await original_worker(request)
+
+    engine.provider_worker = _worker
+
+    real_wait = asyncio.wait
+
+    async def _short_wait(tasks, *, return_when, timeout=None):
+        return await real_wait(tasks, return_when=return_when, timeout=0.02)
+
+    monkeypatch.setattr(asyncio, "wait", _short_wait)
+
+    result = await engine.consult("fast quorum", "reasoning", mode="all")
+
+    assert result["all_responses"]["delta"]["status"] == "cancelled"
+    assert result["all_responses"]["delta"]["final_score"] == 0.0
+    assert "delta" not in breaker.successes.calls
+    assert "delta" not in breaker.failures.calls
+    assert "delta" not in quality.successes.calls
+    assert "delta" not in quality.failures.calls
+
+
+@pytest.mark.asyncio
 async def test_external_mode_with_no_external_muses_errors(monkeypatch):
     local_only = {
         "lan_cerberus": _provider_config(

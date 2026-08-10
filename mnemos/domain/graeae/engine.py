@@ -1030,11 +1030,25 @@ class GraeaeEngine:
                 return name, False
             if not await call_maybe_async(concurrency.acquire, name):
                 return name, False
+            acquired.append(name)
             return name, True
 
-        eligibility = await asyncio.gather(
-            *(_check_provider_eligibility(name) for name in candidate_providers)
-        )
+        acquired: list[str] = []
+        eligibility_tasks = [
+            asyncio.create_task(_check_provider_eligibility(name))
+            for name in candidate_providers
+        ]
+        try:
+            eligibility = await asyncio.gather(*eligibility_tasks)
+        except BaseException:
+            for task in eligibility_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*eligibility_tasks, return_exceptions=True)
+            await asyncio.gather(
+                *(call_maybe_async(concurrency.release, name) for name in acquired)
+            )
+            raise
         active = [name for name, is_active in eligibility if is_active]
         skipped = [name for name, is_active in eligibility if not is_active]
 
@@ -1207,6 +1221,23 @@ class GraeaeEngine:
                     "model_id": self.providers[name]["model"],
                     "final_score": 0.0,
                 }
+            if not isinstance(result, dict):
+                return name, {
+                    "status": "error",
+                    "response_text": "",
+                    "error": f"unexpected provider result: {type(result).__name__}",
+                    "latency_ms": 0,
+                    "model_id": self.providers[name]["model"],
+                    "final_score": 0.0,
+                }
+            if result.get("status") == "cancelled":
+                result["final_score"] = 0.0
+                return name, result
+            if result.get("status") != "success":
+                await call_maybe_async(self._circuit_breakers.record_failure, name)
+                await call_maybe_async(self._quality.record_failure, name)
+                result["final_score"] = 0.0
+                return name, result
             await call_maybe_async(self._circuit_breakers.record_success, name)
             recorded_weight = await call_maybe_async(
                 self._quality.record_success,

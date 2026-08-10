@@ -65,3 +65,38 @@ async def test_consult_cancellation_releases_provider_slots(monkeypatch):
         await task
 
     assert limiter.in_flight == 0
+
+
+async def test_eligibility_exception_releases_slots_already_acquired():
+    engine = GraeaeEngine()
+    engine.providers = {
+        "p1": {"model": "m1", "weight": 1.0},
+        "p2": {"model": "m2", "weight": 1.0},
+    }
+    engine._circuit_breakers = _AlwaysAllowed()
+    engine._cache = _Cache()
+
+    acquired = asyncio.Event()
+
+    class _CoordinatedLimiter(_Limiter):
+        async def acquire(self, provider):
+            result = await super().acquire(provider)
+            if provider == "p1":
+                acquired.set()
+            return result
+
+    class _FailingRateLimiter:
+        async def is_allowed(self, provider):
+            if provider == "p2":
+                await acquired.wait()
+                raise RuntimeError("redis unavailable")
+            return True
+
+    limiter = _CoordinatedLimiter()
+    engine._concurrency = limiter
+    engine._rate_limiters = _FailingRateLimiter()
+
+    with pytest.raises(RuntimeError, match="redis unavailable"):
+        await engine.consult("prompt", "reasoning")
+
+    assert limiter.in_flight == 0

@@ -36,6 +36,11 @@ from mnemos.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
+
+class ProviderFetchError(RuntimeError):
+    """Raised when a live provider catalog cannot be fetched completely."""
+
+
 # ── Key store ──────────────────────────────────────────────────────────────────
 
 
@@ -80,7 +85,7 @@ async def _fetch_openai_compatible(
             data = resp.json()
     except Exception as exc:
         logger.warning(f"[SYNC:{provider}] fetch failed: {exc}")
-        return []
+        raise ProviderFetchError(f"{provider} model fetch failed: {exc}") from exc
 
     models = []
     items = data if isinstance(data, list) else data.get("data", [])
@@ -224,6 +229,7 @@ async def _fetch_gemini(timeout: int = 20) -> list[dict]:
 
     except Exception as exc:
         logger.warning(f"[SYNC:gemini] fetch failed: {exc}")
+        raise ProviderFetchError(f"gemini model fetch failed: {exc}") from exc
 
     return models
 

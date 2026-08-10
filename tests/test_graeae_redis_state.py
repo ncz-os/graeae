@@ -6,7 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 
+from mnemos.api.routes import consultations
 from mnemos.domain.graeae._cache import RedisResponseCache, make_response_cache
 from mnemos.domain.graeae._quality import (
     RedisQualityTracker,
@@ -105,3 +107,28 @@ def test_graeae_state_factories_select_redis_when_configured():
         make_quality_tracker(settings, {"openai": 0.9}, redis_client=redis),
         RedisQualityTracker,
     )
+
+
+@pytest.mark.asyncio
+async def test_consult_quota_uses_atomic_shared_redis_script(monkeypatch):
+    redis = SimpleNamespace(eval=AsyncMock(return_value=[1, b"5", 0]))
+    monkeypatch.setattr(
+        consultations, "_get_lifecycle_redis_client", lambda: redis
+    )
+    monkeypatch.setenv("MNEMOS_GRAEAE_CONSULT_QUOTA_PER_MIN", "20")
+
+    await consultations._enforce_consult_quota("principal-1", "all")
+
+    args = redis.eval.await_args.args
+    assert args[0] == consultations._CONSULT_QUOTA_LUA
+    assert args[1] == 2
+    assert args[2].startswith("mnemos:graeae:consult-quota:")
+    assert args[3] == f"{args[2]}:sequence"
+    assert args[4:] == (5.0, 20.0, 60_000)
+
+    redis.eval.return_value = [0, b"20", 12_500]
+    with pytest.raises(HTTPException) as exc_info:
+        await consultations._enforce_consult_quota("principal-1", "all")
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.headers["Retry-After"] == "13"
