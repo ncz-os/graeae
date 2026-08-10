@@ -472,12 +472,18 @@ async def test_majority_mode_reports_quorum_reached(monkeypatch):
             "alpha": "approve the design because it has a stable cache boundary",
             "beta": "approve the design because it has a stable cache boundary",
             "gamma": "approve the design because it has a stable cache boundary",
+            "delta": "approve the design because it has a stable cache boundary",
         },
     )
 
     result = await engine.consult("approve?", "architecture_design", mode="majority")
 
-    assert [call["provider"] for call in calls] == ["alpha", "beta", "gamma"]
+    assert [call["provider"] for call in calls] == [
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+    ]
     assert result["quorum_reached"] is True
     assert result["consensus_score"] >= result["quorum_threshold"]
 

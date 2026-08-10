@@ -945,7 +945,7 @@ async def list_modes(_: UserContext = Depends(get_current_user)):
             },
             {
                 "name": "majority",
-                "description": "fan out to up to three muses and report whether quorum agreement was reached",
+                "description": "fan out to up to five muses and report whether quorum agreement was reached",
             },
         ],
         "validation": {
