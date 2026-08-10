@@ -24,8 +24,7 @@ from collections import OrderedDict
 from typing import Any
 
 from mnemos.core.resilience import (
-    _get_lifecycle_redis_client,
-    _redis_requested,
+    _redis_storage_uri,
     _warn_fallback,
 )
 
@@ -157,11 +156,22 @@ def make_response_cache(
     max_entries: int = _MAX_ENTRIES,
     redis_client: Any | None = None,
 ) -> ResponseCache | RedisResponseCache:
-    if _redis_requested(settings):
-        client = redis_client if redis_client is not None else _get_lifecycle_redis_client()
+    redis_uri = _redis_storage_uri(settings)
+    if redis_uri:
+        client = redis_client
+        if client is None:
+            try:
+                import redis.asyncio as redis
+
+                client = redis.from_url(redis_uri, decode_responses=True)
+            except ImportError:
+                _warn_fallback(
+                    settings,
+                    "Redis response cache requested but redis-py is unavailable",
+                )
         if client is not None:
             return RedisResponseCache(client, ttl_seconds=ttl_seconds)
         _warn_fallback(settings, "Redis response cache requested but unavailable")
     else:
-        _warn_fallback(settings, "Redis not configured")
+        _warn_fallback(settings, "No Redis response-cache backend configured")
     return ResponseCache(ttl_seconds=ttl_seconds, max_entries=max_entries)

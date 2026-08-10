@@ -14,8 +14,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import require_consultations_backend
+from mnemos.core.config import get_settings
 from mnemos.core.rate_limit import limiter
-from mnemos.core.resilience import _get_lifecycle_redis_client
+from mnemos.core.resilience import _redis_storage_uri
 from mnemos.core.security import is_root, scope_namespace
 from mnemos.domain.graeae.engine import _REGISTRY_MAP
 from mnemos.domain.models import (
@@ -120,6 +121,7 @@ _MODE_COST_WEIGHT = {
 }
 _QUOTA_WINDOW_SECONDS = 60.0
 _QUOTA_KEY_PREFIX = "mnemos:graeae:consult-quota:"
+_consult_quota_redis = None
 
 _CONSULT_QUOTA_LUA = """
 local key = KEYS[1]
@@ -162,6 +164,29 @@ def _consult_quota_per_min() -> float:
         return float(os.environ.get("MNEMOS_GRAEAE_CONSULT_QUOTA_PER_MIN", "20"))
     except ValueError:
         return 20.0
+
+
+def _get_lifecycle_redis_client():
+    """Return the route-owned Redis client selected by core resilience config.
+
+    Core no longer exposes a lifecycle Redis client. Its current Redis
+    resilience backends derive the connection from ``rate_limit.storage_uri``
+    and own their client, so this route follows the same model. The historical
+    function name remains as a narrow compatibility seam for callers that
+    inject a test client.
+    """
+    global _consult_quota_redis
+    if _consult_quota_redis is not None:
+        return _consult_quota_redis
+    redis_uri = _redis_storage_uri(get_settings())
+    if not redis_uri:
+        return None
+    try:
+        import redis.asyncio as redis
+    except ImportError:
+        return None
+    _consult_quota_redis = redis.from_url(redis_uri, decode_responses=True)
+    return _consult_quota_redis
 
 
 async def _enforce_consult_quota(user_id: str, mode: str) -> None:

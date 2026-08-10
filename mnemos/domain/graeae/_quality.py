@@ -14,8 +14,7 @@ from collections import deque
 from typing import Any
 
 from mnemos.core.resilience import (
-    _get_lifecycle_redis_client,
-    _redis_requested,
+    _redis_storage_uri,
     _warn_fallback,
 )
 
@@ -225,13 +224,22 @@ def make_quality_tracker(
     *,
     redis_client: Any | None = None,
 ) -> QualityTracker | RedisQualityTracker:
-    if _redis_requested(settings):
-        client = (
-            redis_client if redis_client is not None else _get_lifecycle_redis_client()
-        )
+    redis_uri = _redis_storage_uri(settings)
+    if redis_uri:
+        client = redis_client
+        if client is None:
+            try:
+                import redis.asyncio as redis
+
+                client = redis.from_url(redis_uri, decode_responses=True)
+            except ImportError:
+                _warn_fallback(
+                    settings,
+                    "Redis quality tracker requested but redis-py is unavailable",
+                )
         if client is not None:
             return RedisQualityTracker(client, provider_weights)
         _warn_fallback(settings, "Redis quality tracker requested but unavailable")
     else:
-        _warn_fallback(settings, "Redis not configured")
+        _warn_fallback(settings, "No Redis quality-tracker backend configured")
     return QualityTracker(provider_weights)
