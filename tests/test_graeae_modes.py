@@ -636,6 +636,22 @@ async def test_local_mode_queries_only_local_muses(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cache_separates_external_and_local_modes(monkeypatch):
+    engine, calls = _build_engine(monkeypatch, providers=_scoped_providers())
+
+    external = await engine.consult("same prompt", "reasoning", mode="external")
+    local = await engine.consult("same prompt", "reasoning", mode="local")
+
+    assert set(external["all_responses"]) == {
+        "cloud_openai",
+        "cloud_xai",
+        "shim_openai",
+    }
+    assert set(local["all_responses"]) == {"lan_cerberus", "lan_hydra"}
+    assert {call["provider"] for call in calls} == set(_scoped_providers())
+
+
+@pytest.mark.asyncio
 async def test_all_mode_queries_every_muse_regardless_of_scope(monkeypatch):
     engine, _calls = _build_engine(monkeypatch, providers=_scoped_providers())
 
@@ -676,6 +692,27 @@ async def test_consult_runs_independent_provider_state_checks_in_parallel(monkey
     assert concurrency.released.max_in_flight > 1
     assert quality.successes.max_in_flight > 1
     assert quality.dynamic_weight_calls == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_returns_paid_result_when_quality_recording_fails(monkeypatch):
+    import mnemos.domain.graeae.engine as graeae_engine
+
+    engine, _calls = _build_engine(monkeypatch)
+    monkeypatch.setattr(graeae_engine, "get_key", lambda _name: "test-key")
+    engine._quality.record_success = AsyncMock(
+        side_effect=ConnectionError("redis failed after provider response")
+    )
+
+    result = await engine.route(
+        "alpha",
+        "alpha-model",
+        "paid request",
+        task_type="reasoning",
+    )
+
+    assert result["status"] == "success"
+    assert result["response_text"] == "alpha response to paid request"
 
 
 @pytest.mark.asyncio

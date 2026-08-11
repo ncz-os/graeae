@@ -9,7 +9,11 @@ import pytest
 from fastapi import HTTPException
 
 from mnemos.api.routes import consultations
-from mnemos.domain.graeae._cache import RedisResponseCache, make_response_cache
+from mnemos.domain.graeae._cache import (
+    ResponseCache,
+    RedisResponseCache,
+    make_response_cache,
+)
 from mnemos.domain.graeae._quality import (
     RedisQualityTracker,
     _REDIS_QUALITY_EWMA_LUA,
@@ -23,11 +27,26 @@ def _settings(storage_uri: str = "redis://redis:6379/1"):
         rate_limit=SimpleNamespace(storage_uri=storage_uri),
         resilience=SimpleNamespace(
             fallback_warning=False,
+            allow_in_process_fallback=False,
             circuit_breaker_redis_prefix="test:cb:",
             rate_limiter_redis_prefix="test:rl:",
             concurrency_redis_prefix="test:conc:",
         ),
     )
+
+
+def test_in_process_response_cache_isolates_stored_and_returned_values():
+    cache = ResponseCache()
+    value = {"openai": {"response_text": "complete"}}
+
+    cache.set("prompt", "reasoning", value)
+    value["openai"]["response_text"] = "mutated after set"
+    first = cache.get("prompt", "reasoning")
+    first["openai"]["response_text"] = "mutated after get"
+
+    assert cache.get("prompt", "reasoning") == {
+        "openai": {"response_text": "complete"}
+    }
 
 
 @pytest.mark.asyncio
@@ -108,6 +127,69 @@ def test_graeae_state_factories_select_redis_when_configured():
         make_quality_tracker(settings, {"openai": 0.9}, redis_client=redis),
         RedisQualityTracker,
     )
+
+
+@pytest.mark.parametrize("profile", ["personal", "edge", "dev", "server"])
+@pytest.mark.parametrize("allow_fallback", [False, True])
+def test_redis_fallback_setting_is_profile_independent(profile, allow_fallback):
+    redis = SimpleNamespace()
+    settings = _settings()
+    settings.server.profile = profile
+    settings.resilience.allow_in_process_fallback = allow_fallback
+
+    cache = make_response_cache(settings, redis_client=redis)
+    quality = make_quality_tracker(settings, {"openai": 0.9}, redis_client=redis)
+
+    assert (cache._fallback is not None) is allow_fallback
+    assert (quality._fallback is not None) is allow_fallback
+
+
+@pytest.mark.asyncio
+async def test_redis_response_cache_runtime_failure_uses_configured_fallback():
+    redis = SimpleNamespace(
+        get=AsyncMock(side_effect=ConnectionError("redis down")),
+        set=AsyncMock(side_effect=ConnectionError("redis down")),
+    )
+    settings = _settings()
+    settings.resilience.allow_in_process_fallback = True
+    cache = make_response_cache(settings, redis_client=redis)
+    payload = {"openai": {"response_text": "paid result"}}
+
+    await cache.set("prompt", "reasoning", payload)
+    result = await cache.get("prompt", "reasoning")
+
+    assert result == payload
+    assert cache.stats()["degraded"] is True
+    assert cache.stats()["fallback_backend"] == "in_process"
+
+
+@pytest.mark.asyncio
+async def test_redis_quality_runtime_failure_uses_configured_fallback():
+    from mnemos.domain.graeae.engine import GraeaeEngine
+
+    redis = SimpleNamespace(
+        eval=AsyncMock(side_effect=ConnectionError("redis down")),
+        zscore=AsyncMock(side_effect=ConnectionError("redis down")),
+    )
+    settings = _settings()
+    settings.resilience.allow_in_process_fallback = True
+    tracker = make_quality_tracker(settings, {"openai": 0.9}, redis_client=redis)
+
+    weight = await tracker.record_success("openai", 120)
+    read_weight = await tracker.dynamic_weight("openai")
+
+    assert weight == 0.9
+    assert read_weight == 0.9
+    assert tracker.backend_status()["degraded"] is True
+
+    engine = GraeaeEngine.__new__(GraeaeEngine)
+    engine._quality = tracker
+    engine._cache = ResponseCache()
+    engine._circuit_breakers = SimpleNamespace(status=lambda: {})
+    engine._rate_limiters = SimpleNamespace(status=lambda: {})
+    engine._concurrency = None
+
+    assert engine.provider_status()["quality_backend"]["degraded"] is True
 
 
 @pytest.mark.asyncio

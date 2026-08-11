@@ -20,6 +20,7 @@ import json
 import logging
 import threading
 import time
+from copy import deepcopy
 from collections import OrderedDict
 from typing import Any
 
@@ -63,12 +64,12 @@ class ResponseCache:
                 return None
             self._store.move_to_end(key)
             self._hits += 1
-            return value
+            return deepcopy(value)
 
     def set(self, prompt: str, task_type: str, value: Any, model: str = "") -> None:
         key = self._key(prompt, task_type, model)
         with self._lock:
-            self._store[key] = (time.monotonic(), value)
+            self._store[key] = (time.monotonic(), deepcopy(value))
             self._store.move_to_end(key)
             while len(self._store) > self.max_entries:
                 self._store.popitem(last=False)
@@ -94,6 +95,7 @@ class RedisResponseCache:
         key_prefix: str = _REDIS_KEY_PREFIX,
         *,
         owns_client: bool = False,
+        fallback: ResponseCache | None = None,
     ):
         self.redis = redis_client
         self.ttl = ttl_seconds
@@ -101,6 +103,22 @@ class RedisResponseCache:
         self._hits = 0
         self._misses = 0
         self._owns_client = owns_client
+        self._fallback = fallback
+        self._degraded = False
+        self._last_error: str | None = None
+
+    def _redis_failed(self, operation: str, exc: Exception) -> None:
+        self._degraded = True
+        self._last_error = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "Redis response cache %s failed; using in-process fallback: %s",
+            operation,
+            exc,
+        )
+
+    def _redis_succeeded(self) -> None:
+        self._degraded = False
+        self._last_error = None
 
     def _key(self, prompt: str, task_type: str, model: str = "") -> str:
         digest = hashlib.sha256(
@@ -109,7 +127,14 @@ class RedisResponseCache:
         return f"{self.key_prefix}{digest}"
 
     async def get(self, prompt: str, task_type: str, model: str = "") -> Any | None:
-        raw = await self.redis.get(self._key(prompt, task_type, model))
+        try:
+            raw = await self.redis.get(self._key(prompt, task_type, model))
+            self._redis_succeeded()
+        except Exception as exc:
+            if self._fallback is None:
+                raise
+            self._redis_failed("GET", exc)
+            return self._fallback.get(prompt, task_type, model)
         if raw is None:
             self._misses += 1
             return None
@@ -120,7 +145,15 @@ class RedisResponseCache:
 
     async def set(self, prompt: str, task_type: str, value: Any, model: str = "") -> None:
         payload = json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
-        await self.redis.set(self._key(prompt, task_type, model), payload, ex=self.ttl)
+        if self._fallback is not None:
+            self._fallback.set(prompt, task_type, value, model)
+        try:
+            await self.redis.set(self._key(prompt, task_type, model), payload, ex=self.ttl)
+            self._redis_succeeded()
+        except Exception as exc:
+            if self._fallback is None:
+                raise
+            self._redis_failed("SET", exc)
 
     async def get_many(
         self,
@@ -129,7 +162,18 @@ class RedisResponseCache:
         if not items:
             return {}
         keys = [self._key(prompt, task_type, model) for prompt, task_type, model in items]
-        values = await self.redis.mget(keys)
+        try:
+            values = await self.redis.mget(keys)
+            self._redis_succeeded()
+        except Exception as exc:
+            if self._fallback is None:
+                raise
+            self._redis_failed("MGET", exc)
+            return {
+                item: value
+                for item in items
+                if (value := self._fallback.get(*item)) is not None
+            }
         found: dict[tuple[str, str, str], Any] = {}
         for item, raw in zip(items, values):
             if raw is None:
@@ -145,6 +189,9 @@ class RedisResponseCache:
         total = self._hits + self._misses
         return {
             "backend": "redis",
+            "degraded": self._degraded,
+            "fallback_backend": "in_process" if self._fallback is not None else None,
+            "last_error": self._last_error,
             "entries": None,
             "hits": self._hits,
             "misses": self._misses,
@@ -184,7 +231,24 @@ def make_response_cache(
                     "Redis response cache requested but redis-py is unavailable",
                 )
         if client is not None:
-            return RedisResponseCache(client, ttl_seconds=ttl_seconds, owns_client=owns_client)
+            allow_fallback = bool(
+                getattr(
+                    getattr(settings, "resilience", None),
+                    "allow_in_process_fallback",
+                    False,
+                )
+            )
+            fallback = (
+                ResponseCache(ttl_seconds=ttl_seconds, max_entries=max_entries)
+                if allow_fallback
+                else None
+            )
+            return RedisResponseCache(
+                client,
+                ttl_seconds=ttl_seconds,
+                owns_client=owns_client,
+                fallback=fallback,
+            )
         _warn_fallback(settings, "Redis response cache requested but unavailable")
     else:
         _warn_fallback(settings, "No Redis response-cache backend configured")

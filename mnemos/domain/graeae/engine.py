@@ -976,24 +976,6 @@ class GraeaeEngine:
         if mode not in {"auto", "local", "external", "all"}:
             raise ValueError(f"unsupported consultation mode {mode!r}")
 
-        # ── Cache check ──────────────────────────────────────────────────────
-        # Include the selection (or lack thereof) in the cache key so a
-        # Custom Query for "frontier only" doesn't get served the cached
-        # all-providers response for the same prompt.
-        cache_model = _selection_cache_tag(selection) if selection else "default"
-        cached = await call_maybe_async(self._cache.get, prompt, task_type, cache_model)
-        if cached is not None:
-            logger.info(
-                f"[GRAEAE] cache hit (task_type={task_type}, model={cache_model})"
-            )
-            return {
-                "all_responses": cached,
-                "cache_hit": True,
-                **_compute_consensus(cached),
-            }
-
-        concurrency = self._get_concurrency()
-
         # ── Selection-aware iteration list ───────────────────────────────────
         # If Custom Query set a lineup, respect it verbatim; unknown
         # provider names should have been rejected by the caller before
@@ -1032,6 +1014,32 @@ class GraeaeEngine:
                         "all_responses": {},
                         "error": f"no {mode} providers configured",
                     }
+
+        # Cache identity is derived only after the scope filter. It binds the
+        # normalized mode and every effective provider/model pair, preventing
+        # local requests from consuming external responses (and stale lineups
+        # from surviving a provider-model configuration change).
+        effective_lineup = {
+            name: (
+                selection.get(name)
+                if selection is not None and selection.get(name) is not None
+                else self.providers[name].get("model")
+            )
+            for name in candidate_providers
+        }
+        cache_model = f"mode={mode}{_selection_cache_tag(effective_lineup)}"
+        cached = await call_maybe_async(self._cache.get, prompt, task_type, cache_model)
+        if cached is not None:
+            logger.info(
+                f"[GRAEAE] cache hit (task_type={task_type}, model={cache_model})"
+            )
+            return {
+                "all_responses": cached,
+                "cache_hit": True,
+                **_compute_consensus(cached),
+            }
+
+        concurrency = self._get_concurrency()
 
         # ── Eligibility gate ─────────────────────────────────────────────────
         # A provider is skipped (not queued) if it is:
@@ -1225,7 +1233,10 @@ class GraeaeEngine:
         ) -> tuple[str, Dict]:
             if isinstance(result, Exception):
                 await call_maybe_async(self._circuit_breakers.record_failure, name)
-                await call_maybe_async(self._quality.record_failure, name)
+                try:
+                    await call_maybe_async(self._quality.record_failure, name)
+                except Exception as exc:
+                    logger.error("[GRAEAE] quality failure record failed for %s: %s", name, exc)
                 err_msg = f"{type(result).__name__}: {str(result)[:400]}"
                 logger.warning(f"[GRAEAE] muse {name} failed: {err_msg}")
                 return name, {
@@ -1250,20 +1261,31 @@ class GraeaeEngine:
                 return name, result
             if result.get("status") != "success":
                 await call_maybe_async(self._circuit_breakers.record_failure, name)
-                await call_maybe_async(self._quality.record_failure, name)
+                try:
+                    await call_maybe_async(self._quality.record_failure, name)
+                except Exception as exc:
+                    logger.error("[GRAEAE] quality failure record failed for %s: %s", name, exc)
                 result["final_score"] = 0.0
                 return name, result
             await call_maybe_async(self._circuit_breakers.record_success, name)
-            recorded_weight = await call_maybe_async(
-                self._quality.record_success,
-                name,
-                result.get("latency_ms", 0),
-            )
-            if recorded_weight is None:
+            try:
                 recorded_weight = await call_maybe_async(
-                    self._quality.dynamic_weight,
+                    self._quality.record_success,
                     name,
+                    result.get("latency_ms", 0),
                 )
+            except Exception as exc:
+                logger.error("[GRAEAE] quality success record failed for %s: %s", name, exc)
+                recorded_weight = self.providers[name].get("weight", 0.0)
+            if recorded_weight is None:
+                try:
+                    recorded_weight = await call_maybe_async(
+                        self._quality.dynamic_weight,
+                        name,
+                    )
+                except Exception as exc:
+                    logger.error("[GRAEAE] quality weight read failed for %s: %s", name, exc)
+                    recorded_weight = self.providers[name].get("weight", 0.0)
             result["final_score"] = recorded_weight
             return name, result
 
@@ -1280,9 +1302,12 @@ class GraeaeEngine:
 
         # ── Cache successful result ──────────────────────────────────────────
         if any(r["status"] == "success" for r in all_responses.values()):
-            await call_maybe_async(
-                self._cache.set, prompt, task_type, all_responses, cache_model
-            )
+            try:
+                await call_maybe_async(
+                    self._cache.set, prompt, task_type, all_responses, cache_model
+                )
+            except Exception as exc:
+                logger.error("[GRAEAE] response cache write failed: %s", exc)
 
         # ── Compute consensus fields (v3.2) ──────────────────────────────────
         # ConsultationResponse has exposed consensus_response,
@@ -1658,7 +1683,14 @@ class GraeaeEngine:
                 # gateway-path failures actually trip it, and quality
                 # tracker so the weight reflects reality.
                 await call_maybe_async(self._circuit_breakers.record_failure, provider)
-                await call_maybe_async(self._quality.record_failure, provider)
+                try:
+                    await call_maybe_async(self._quality.record_failure, provider)
+                except Exception as quality_exc:
+                    logger.error(
+                        "[GRAEAE] quality failure record failed for route(%s): %s",
+                        provider,
+                        quality_exc,
+                    )
                 logger.error(f"[GRAEAE] route({provider}) failed: {e}", exc_info=True)
                 return _unavailable(
                     provider_config["model"],
@@ -1668,9 +1700,16 @@ class GraeaeEngine:
             # the gateway's successes count toward reopening a
             # half-open circuit, not just consultations' successes.
             await call_maybe_async(self._circuit_breakers.record_success, provider)
-            await call_maybe_async(
-                self._quality.record_success, provider, result.get("latency_ms", 0)
-            )
+            try:
+                await call_maybe_async(
+                    self._quality.record_success, provider, result.get("latency_ms", 0)
+                )
+            except Exception as exc:
+                logger.error(
+                    "[GRAEAE] quality record failed after successful route(%s): %s",
+                    provider,
+                    exc,
+                )
             logger.debug(
                 f"[GRAEAE] route({provider}, {model or 'default'}) → {result['status']}"
             )
@@ -1785,11 +1824,25 @@ class GraeaeEngine:
                         yield {"index": 0, "finish_reason": finish_reason}
             except Exception:
                 await call_maybe_async(self._circuit_breakers.record_failure, provider)
-                await call_maybe_async(self._quality.record_failure, provider)
+                try:
+                    await call_maybe_async(self._quality.record_failure, provider)
+                except Exception as exc:
+                    logger.error(
+                        "[GRAEAE] quality failure record failed for stream(%s): %s",
+                        provider,
+                        exc,
+                    )
                 raise
             else:
                 await call_maybe_async(self._circuit_breakers.record_success, provider)
-                await call_maybe_async(self._quality.record_success, provider, 0)
+                try:
+                    await call_maybe_async(self._quality.record_success, provider, 0)
+                except Exception as exc:
+                    logger.error(
+                        "[GRAEAE] quality record failed after successful stream(%s): %s",
+                        provider,
+                        exc,
+                    )
         finally:
             await call_maybe_async(concurrency.release, provider)
 
@@ -2169,6 +2222,9 @@ class GraeaeEngine:
             "quality": self._quality.status(),
             "cache": self._cache.stats(),
         }
+        quality_backend_status = getattr(self._quality, "backend_status", None)
+        if quality_backend_status is not None:
+            status["quality_backend"] = quality_backend_status()
         if self._concurrency:
             status["concurrency"] = self._concurrency.status()
         return status
