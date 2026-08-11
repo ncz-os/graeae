@@ -234,6 +234,36 @@ async def test_single_worker_memory_profiles_use_atomic_local_quota(monkeypatch,
     assert exc_info.value.status_code == 429
 
 
+def test_local_consult_quota_periodically_collects_idle_principals(monkeypatch):
+    monkeypatch.setattr(consultations, "_CONSULT_QUOTA_GC_INTERVAL", 2)
+    timestamps = iter([0.0, 61.0])
+    monkeypatch.setattr(consultations.time, "monotonic", lambda: next(timestamps))
+    consultations._consult_quota_local.clear()
+    consultations._consult_quota_gc_touches = 0
+
+    consultations._enforce_local_consult_quota("idle", 1.0, 20.0)
+    consultations._enforce_local_consult_quota("active", 1.0, 20.0)
+
+    assert set(consultations._consult_quota_local) == {"active"}
+
+
+def test_local_consult_quota_has_hard_principal_cap(monkeypatch):
+    monkeypatch.setattr(consultations, "_CONSULT_QUOTA_MAX_BUCKETS", 4)
+    monkeypatch.setattr(consultations, "_CONSULT_QUOTA_GC_INTERVAL", 10_000)
+    timestamps = iter(range(5))
+    monkeypatch.setattr(
+        consultations.time, "monotonic", lambda: float(next(timestamps))
+    )
+    consultations._consult_quota_local.clear()
+    consultations._consult_quota_gc_touches = 0
+
+    for principal in ("one", "two", "three", "four", "five"):
+        consultations._enforce_local_consult_quota(principal, 1.0, 20.0)
+
+    assert len(consultations._consult_quota_local) <= 4
+    assert "five" in consultations._consult_quota_local
+
+
 @pytest.mark.parametrize(
     ("profile", "workers"),
     [("server", 1), ("server", 4), ("edge", 2), ("dev", 2)],

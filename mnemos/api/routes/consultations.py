@@ -126,6 +126,9 @@ _QUOTA_KEY_PREFIX = "mnemos:graeae:consult-quota:"
 _consult_quota_redis = None
 _consult_quota_local: dict[str, list[tuple[float, float]]] = {}
 _consult_quota_local_lock = threading.Lock()
+_CONSULT_QUOTA_GC_INTERVAL = 256
+_CONSULT_QUOTA_MAX_BUCKETS = 4096
+_consult_quota_gc_touches = 0
 
 _CONSULT_QUOTA_LUA = """
 local key = KEYS[1]
@@ -205,11 +208,50 @@ def _single_worker_memory_quota_enabled(settings) -> bool:
     return profile in {"edge", "dev"} and workers == 1 and storage_uri == "memory://"
 
 
+def _gc_local_consult_quota(*, cutoff: float) -> None:
+    """Drop idle local quota buckets while holding the quota lock."""
+    stale = [
+        principal
+        for principal, entries in _consult_quota_local.items()
+        if not entries or entries[-1][0] <= cutoff
+    ]
+    for principal in stale:
+        _consult_quota_local.pop(principal, None)
+
+
+def _evict_oldest_local_consult_quota(*, target_size: int) -> None:
+    """Bound local fallback memory by evicting least-recently-used buckets."""
+    if len(_consult_quota_local) <= target_size:
+        return
+    oldest_first = sorted(
+        _consult_quota_local.items(),
+        key=lambda item: item[1][-1][0] if item[1] else float("-inf"),
+    )
+    for principal, _entries in oldest_first[: len(_consult_quota_local) - target_size]:
+        _consult_quota_local.pop(principal, None)
+
+
 def _enforce_local_consult_quota(principal: str, weight: float, quota: float) -> None:
     """Atomically enforce quota for supported single-process deployments."""
+    global _consult_quota_gc_touches
     now = time.monotonic()
     cutoff = now - _QUOTA_WINDOW_SECONDS
     with _consult_quota_local_lock:
+        _consult_quota_gc_touches += 1
+        if _consult_quota_gc_touches >= _CONSULT_QUOTA_GC_INTERVAL:
+            _consult_quota_gc_touches = 0
+            _gc_local_consult_quota(cutoff=cutoff)
+
+        # Enforce the cap before creating a new principal bucket. Run a stale
+        # sweep first even between periodic sweeps, then evict the oldest half
+        # if high-cardinality churn still fills the map.
+        if principal not in _consult_quota_local and len(_consult_quota_local) >= _CONSULT_QUOTA_MAX_BUCKETS:
+            _gc_local_consult_quota(cutoff=cutoff)
+            if len(_consult_quota_local) >= _CONSULT_QUOTA_MAX_BUCKETS:
+                _evict_oldest_local_consult_quota(
+                    target_size=max(0, _CONSULT_QUOTA_MAX_BUCKETS // 2)
+                )
+
         entries = [entry for entry in _consult_quota_local.get(principal, []) if entry[0] > cutoff]
         used = sum(entry[1] for entry in entries)
         if used + weight > quota:
@@ -229,9 +271,10 @@ def _enforce_local_consult_quota(principal: str, weight: float, quota: float) ->
 
 async def close_consult_quota_client() -> None:
     """Close and clear the route-owned Redis client during lifespan teardown."""
-    global _consult_quota_redis
+    global _consult_quota_gc_touches, _consult_quota_redis
     with _consult_quota_local_lock:
         _consult_quota_local.clear()
+        _consult_quota_gc_touches = 0
     client, _consult_quota_redis = _consult_quota_redis, None
     if client is None:
         return
