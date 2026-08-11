@@ -92,12 +92,15 @@ class RedisResponseCache:
         redis_client: Any,
         ttl_seconds: int = _DEFAULT_TTL,
         key_prefix: str = _REDIS_KEY_PREFIX,
+        *,
+        owns_client: bool = False,
     ):
         self.redis = redis_client
         self.ttl = ttl_seconds
         self.key_prefix = key_prefix
         self._hits = 0
         self._misses = 0
+        self._owns_client = owns_client
 
     def _key(self, prompt: str, task_type: str, model: str = "") -> str:
         digest = hashlib.sha256(
@@ -148,6 +151,15 @@ class RedisResponseCache:
             "hit_rate": round(self._hits / total, 3) if total else 0.0,
         }
 
+    async def close(self) -> None:
+        if not self._owns_client:
+            return
+        close = getattr(self.redis, "aclose", None) or getattr(self.redis, "close", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
 
 def make_response_cache(
     settings: Any,
@@ -159,18 +171,20 @@ def make_response_cache(
     redis_uri = _redis_storage_uri(settings)
     if redis_uri:
         client = redis_client
+        owns_client = False
         if client is None:
             try:
                 import redis.asyncio as redis
 
                 client = redis.from_url(redis_uri, decode_responses=True)
+                owns_client = True
             except ImportError:
                 _warn_fallback(
                     settings,
                     "Redis response cache requested but redis-py is unavailable",
                 )
         if client is not None:
-            return RedisResponseCache(client, ttl_seconds=ttl_seconds)
+            return RedisResponseCache(client, ttl_seconds=ttl_seconds, owns_client=owns_client)
         _warn_fallback(settings, "Redis response cache requested but unavailable")
     else:
         _warn_fallback(settings, "No Redis response-cache backend configured")

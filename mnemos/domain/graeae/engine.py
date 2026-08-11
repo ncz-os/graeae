@@ -788,13 +788,28 @@ class GraeaeEngine:
         return self._client
 
     async def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         if self._client and not self._client.is_closed:
             await self._client.aclose()
-        close_breakers = getattr(self._circuit_breakers, "close", None)
-        if close_breakers is not None:
-            result = close_breakers()
-            if asyncio.iscoroutine(result):
-                await result
+        resources = [
+            self._cache,
+            self._quality,
+            self._circuit_breakers,
+            self._rate_limiters,
+            self._concurrency,
+        ]
+        for resource in resources:
+            close = getattr(resource, "close", None)
+            if close is not None:
+                await call_maybe_async(close)
+        from mnemos.api.routes.consultations import close_consult_quota_client
+
+        await close_consult_quota_client()
+        global _graeae_engine
+        if _graeae_engine is self:
+            _graeae_engine = None
 
     async def reload_from_registry(self, pool) -> Dict[str, str]:
         """Refresh self.providers[*]['model'] from model_registry.

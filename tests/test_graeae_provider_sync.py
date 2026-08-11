@@ -33,6 +33,22 @@ async def test_openai_fetch_failure_is_reported(monkeypatch):
     assert "401 Unauthorized" in summary["error"]
 
 
+async def test_provider_sync_uses_canonical_key_resolver(monkeypatch):
+    monkeypatch.setattr(provider_sync, "get_key", lambda provider: f"key-for-{provider}")
+
+    assert provider_sync._load_key("openai") == "key-for-openai"
+    assert provider_sync._load_key("together_ai") == "key-for-together_ai"
+
+
+async def test_missing_live_provider_key_is_reported_as_error(monkeypatch):
+    monkeypatch.setattr(provider_sync, "get_key", lambda _provider: None)
+
+    summary = await provider_sync.sync_provider(None, "openai")
+
+    assert summary["models_found"] == 0
+    assert "requires a configured API key" in summary["error"]
+
+
 async def test_gemini_partial_page_failure_does_not_mutate_registry(monkeypatch):
     first = SimpleNamespace(
         raise_for_status=lambda: None,

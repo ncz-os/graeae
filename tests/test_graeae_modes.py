@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Callable
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
@@ -362,6 +365,62 @@ async def test_empty_engine_result_returns_502(
 
     assert resp.status_code == 502
     assert "empty result" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_missing_audit_key_fails_before_provider_dispatch(
+    client: AsyncClient,
+    auth_headers: dict,
+    mock_graeae_engine,
+    monkeypatch,
+):
+    monkeypatch.delenv("MNEMOS_GRAEAE_AUDIT_HMAC_KEY")
+    mock_graeae_engine.consult.reset_mock()
+
+    resp = await client.post(
+        "/v1/consultations",
+        json={"prompt": "do not bill", "task_type": "reasoning"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 503
+    assert "MNEMOS_GRAEAE_AUDIT_HMAC_KEY" in resp.json()["detail"]
+    mock_graeae_engine.consult.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_backend_without_capability_attribute_dispatches_webhook(
+    client: AsyncClient,
+    auth_headers: dict,
+    monkeypatch,
+):
+    import mnemos.core.lifecycle as lifecycle
+
+    consultations_repo = SimpleNamespace(
+        create_consultation_with_audit=AsyncMock(return_value="consultation-1")
+    )
+    webhooks_repo = SimpleNamespace(
+        dispatch_event=AsyncMock(return_value=[])
+    )
+
+    class _Backend:
+        consultations = consultations_repo
+        webhooks = webhooks_repo
+
+        @asynccontextmanager
+        async def transactional(self):
+            yield SimpleNamespace()
+
+    monkeypatch.setattr(lifecycle, "_persistence_backend", _Backend())
+
+    resp = await client.post(
+        "/v1/consultations",
+        json={"prompt": "notify", "task_type": "reasoning"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200, resp.text
+    webhooks_repo.dispatch_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio

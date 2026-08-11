@@ -24,7 +24,6 @@ Usage (standalone, for testing):
 """
 
 import asyncio
-import json
 import logging
 import time
 from pathlib import Path
@@ -32,7 +31,7 @@ from typing import Optional
 
 import httpx
 
-from mnemos.core.config import get_settings
+from mnemos.domain.providers import get_key
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +44,15 @@ class ProviderFetchError(RuntimeError):
 
 
 def _load_key(provider: str) -> Optional[str]:
-    """Load API key from the Provider Registry File."""
-    try:
-        data = json.loads(get_settings().providers.api_keys_file.expanduser().read_text())
-        return data.get("llm_providers", {}).get(provider, {}).get("api_key")
-    except Exception:
-        return None
+    """Resolve a provider key through the canonical core key registry."""
+    return get_key(provider)
+
+
+def _require_key(provider: str) -> str:
+    key = _load_key(provider)
+    if not key:
+        raise ProviderFetchError(f"{provider} model sync requires a configured API key")
+    return key
 
 
 # ── Model family extraction (mirrors model_registry.py) ───────────────────────
@@ -112,10 +114,7 @@ async def _fetch_openai_compatible(
 
 
 async def _fetch_openai(timeout: int = 20) -> list[dict]:
-    key = _load_key("openai")
-    if not key:
-        logger.warning("[SYNC:openai] no API key — skipping")
-        return []
+    key = _require_key("openai")
 
     def _filter(mid: str, _item: dict) -> bool:
         # Only flagship/reasoning models — skip whisper, dall-e, tts, embeddings
@@ -127,10 +126,7 @@ async def _fetch_openai(timeout: int = 20) -> list[dict]:
 
 
 async def _fetch_xai(timeout: int = 20) -> list[dict]:
-    key = _load_key("xai")
-    if not key:
-        logger.warning("[SYNC:xai] no API key — skipping")
-        return []
+    key = _require_key("xai")
 
     def _filter(mid: str, _item: dict) -> bool:
         return mid.startswith("grok-")
@@ -139,10 +135,7 @@ async def _fetch_xai(timeout: int = 20) -> list[dict]:
 
 
 async def _fetch_groq(timeout: int = 20) -> list[dict]:
-    key = _load_key("groq")
-    if not key:
-        logger.warning("[SYNC:groq] no API key — skipping")
-        return []
+    key = _require_key("groq")
 
     def _filter(mid: str, item: dict) -> bool:
         # Groq hosts many models — keep only active chat models
@@ -152,10 +145,7 @@ async def _fetch_groq(timeout: int = 20) -> list[dict]:
 
 
 async def _fetch_together(timeout: int = 60) -> list[dict]:
-    key = _load_key("together_ai")
-    if not key:
-        logger.warning("[SYNC:together] no API key — skipping")
-        return []
+    key = _require_key("together_ai")
 
     def _filter(mid: str, item: dict) -> bool:
         # Together lists image, embedding, rerank models — keep only chat/language
@@ -165,10 +155,7 @@ async def _fetch_together(timeout: int = 60) -> list[dict]:
 
 
 async def _fetch_nvidia(timeout: int = 20) -> list[dict]:
-    key = _load_key("nvidia")
-    if not key:
-        logger.warning("[SYNC:nvidia] no API key — skipping")
-        return []
+    key = _require_key("nvidia")
 
     def _filter(mid: str, item: dict) -> bool:
         # NVIDIA NIM hosts many providers; we want nvidia/* models only
@@ -178,10 +165,7 @@ async def _fetch_nvidia(timeout: int = 20) -> list[dict]:
 
 
 async def _fetch_gemini(timeout: int = 20) -> list[dict]:
-    key = _load_key("google_gemini")
-    if not key:
-        logger.warning("[SYNC:gemini] no API key — skipping")
-        return []
+    key = _require_key("google_gemini")
 
     models = []
     page_token = None

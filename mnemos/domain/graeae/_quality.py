@@ -139,11 +139,13 @@ class RedisQualityTracker:
         *,
         key_prefix: str = _REDIS_KEY_PREFIX,
         alpha: float = _EWMA_ALPHA,
+        owns_client: bool = False,
     ):
         self.redis = redis_client
         self.provider_weights = dict(provider_weights)
         self.key_prefix = key_prefix
         self.alpha = alpha
+        self._owns_client = owns_client
         self._last_status: dict[str, dict[str, float | int]] = {
             provider: {
                 "dynamic_weight": weight,
@@ -217,6 +219,15 @@ class RedisQualityTracker:
     def status(self) -> dict:
         return dict(self._last_status)
 
+    async def close(self) -> None:
+        if not self._owns_client:
+            return
+        close = getattr(self.redis, "aclose", None) or getattr(self.redis, "close", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
 
 def make_quality_tracker(
     settings: Any,
@@ -227,18 +238,20 @@ def make_quality_tracker(
     redis_uri = _redis_storage_uri(settings)
     if redis_uri:
         client = redis_client
+        owns_client = False
         if client is None:
             try:
                 import redis.asyncio as redis
 
                 client = redis.from_url(redis_uri, decode_responses=True)
+                owns_client = True
             except ImportError:
                 _warn_fallback(
                     settings,
                     "Redis quality tracker requested but redis-py is unavailable",
                 )
         if client is not None:
-            return RedisQualityTracker(client, provider_weights)
+            return RedisQualityTracker(client, provider_weights, owns_client=owns_client)
         _warn_fallback(settings, "Redis quality tracker requested but unavailable")
     else:
         _warn_fallback(settings, "No Redis quality-tracker backend configured")

@@ -8,6 +8,8 @@ import hashlib
 import hmac
 import logging
 import os
+import threading
+import time
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -122,6 +124,8 @@ _MODE_COST_WEIGHT = {
 _QUOTA_WINDOW_SECONDS = 60.0
 _QUOTA_KEY_PREFIX = "mnemos:graeae:consult-quota:"
 _consult_quota_redis = None
+_consult_quota_local: dict[str, list[tuple[float, float]]] = {}
+_consult_quota_local_lock = threading.Lock()
 
 _CONSULT_QUOTA_LUA = """
 local key = KEYS[1]
@@ -189,20 +193,73 @@ def _get_lifecycle_redis_client():
     return _consult_quota_redis
 
 
+def _single_worker_memory_quota_enabled(settings) -> bool:
+    """Return whether this is an explicitly local, single-worker profile."""
+    profile = str(getattr(getattr(settings, "server", None), "profile", "") or "").lower()
+    if profile == "personal":
+        profile = "edge"
+    workers = int(getattr(getattr(settings, "server", None), "workers", 1) or 1)
+    storage_uri = str(
+        getattr(getattr(settings, "rate_limit", None), "storage_uri", "") or ""
+    ).lower()
+    return profile in {"edge", "dev"} and workers == 1 and storage_uri == "memory://"
+
+
+def _enforce_local_consult_quota(principal: str, weight: float, quota: float) -> None:
+    """Atomically enforce quota for supported single-process deployments."""
+    now = time.monotonic()
+    cutoff = now - _QUOTA_WINDOW_SECONDS
+    with _consult_quota_local_lock:
+        entries = [entry for entry in _consult_quota_local.get(principal, []) if entry[0] > cutoff]
+        used = sum(entry[1] for entry in entries)
+        if used + weight > quota:
+            retry = max(1, int(entries[0][0] + _QUOTA_WINDOW_SECONDS - now) + 1) if entries else 1
+            _consult_quota_local[principal] = entries
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"GRAEAE consultation quota exceeded for this principal "
+                    f"({used:.0f}+{weight:.0f} > {quota:.0f} cost-units/min)"
+                ),
+                headers={"Retry-After": str(retry)},
+            )
+        entries.append((now, weight))
+        _consult_quota_local[principal] = entries
+
+
+async def close_consult_quota_client() -> None:
+    """Close and clear the route-owned Redis client during lifespan teardown."""
+    global _consult_quota_redis
+    with _consult_quota_local_lock:
+        _consult_quota_local.clear()
+    client, _consult_quota_redis = _consult_quota_redis, None
+    if client is None:
+        return
+    close = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if close is not None:
+        result = close()
+        if hasattr(result, "__await__"):
+            await result
+
+
 async def _enforce_consult_quota(user_id: str, mode: str) -> None:
     """Atomically enforce the shared, cost-weighted per-principal quota."""
     quota = _consult_quota_per_min()
     if quota <= 0:
         return
     weight = _MODE_COST_WEIGHT.get((mode or "auto").lower(), 2.0)
+    settings = get_settings()
+    principal = hashlib.sha256(str(user_id or "anonymous").encode()).hexdigest()
     redis = _get_lifecycle_redis_client()
     if redis is None:
+        if _single_worker_memory_quota_enabled(settings):
+            _enforce_local_consult_quota(principal, weight, quota)
+            return
         raise HTTPException(
             status_code=503,
             detail="Shared consultation quota storage is unavailable.",
         )
 
-    principal = hashlib.sha256(str(user_id or "anonymous").encode()).hexdigest()
     key = f"{_QUOTA_KEY_PREFIX}{principal}"
     try:
         allowed, used_raw, retry_ms = await redis.eval(
@@ -524,6 +581,9 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
     # provider fan-out, so a single caller cannot turn 60 req/min of
     # mode=all/debate into a financial DoS.
     await _enforce_consult_quota(user.user_id, body.mode)
+    # Validate the signing key before provider fan-out incurs cost. The same
+    # precomputed genesis is passed to persistence after the provider returns.
+    genesis_hash = audit_genesis_hash()
     try:
         backend = require_consultations_backend()
         from mnemos.domain.graeae.engine import get_graeae_engine
@@ -619,9 +679,9 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                         # create_consultation_with_audit must adopt
                         # compute_audit_chain_hash for the per-link MAC too, else
                         # verify() below will (correctly) report the chain unsigned.
-                        genesis_hash=audit_genesis_hash(),
+                        genesis_hash=genesis_hash,
                     )
-                    if getattr(backend, "supports_webhooks", False):
+                    if getattr(backend, "supports_webhooks", True):
                         delivery_ids = await backend.webhooks.dispatch_event(
                             tx,
                             "consultation.completed",

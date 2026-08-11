@@ -19,6 +19,7 @@ from mnemos.domain.graeae._quality import (
 
 def _settings(storage_uri: str = "redis://redis:6379/1"):
     return SimpleNamespace(
+        server=SimpleNamespace(profile="server", workers=1),
         rate_limit=SimpleNamespace(storage_uri=storage_uri),
         resilience=SimpleNamespace(
             fallback_warning=False,
@@ -132,3 +133,97 @@ async def test_consult_quota_uses_atomic_shared_redis_script(monkeypatch):
 
     assert exc_info.value.status_code == 429
     assert exc_info.value.headers["Retry-After"] == "13"
+
+
+@pytest.mark.parametrize("profile", ["edge", "dev", "personal"])
+@pytest.mark.asyncio
+async def test_single_worker_memory_profiles_use_atomic_local_quota(monkeypatch, profile):
+    settings = _settings("memory://")
+    settings.server.profile = profile
+    monkeypatch.setattr(consultations, "get_settings", lambda: settings)
+    monkeypatch.setattr(consultations, "_get_lifecycle_redis_client", lambda: None)
+    monkeypatch.setenv("MNEMOS_GRAEAE_CONSULT_QUOTA_PER_MIN", "5")
+    consultations._consult_quota_local.clear()
+
+    await consultations._enforce_consult_quota("local-principal", "all")
+    with pytest.raises(HTTPException) as exc_info:
+        await consultations._enforce_consult_quota("local-principal", "single")
+
+    assert exc_info.value.status_code == 429
+
+
+@pytest.mark.parametrize(
+    ("profile", "workers"),
+    [("server", 1), ("server", 4), ("edge", 2), ("dev", 2)],
+)
+@pytest.mark.asyncio
+async def test_memory_quota_fails_closed_outside_single_worker_local_profiles(
+    monkeypatch, profile, workers
+):
+    settings = _settings("memory://")
+    settings.server = SimpleNamespace(profile=profile, workers=workers)
+    monkeypatch.setattr(consultations, "get_settings", lambda: settings)
+    monkeypatch.setattr(consultations, "_get_lifecycle_redis_client", lambda: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await consultations._enforce_consult_quota("principal", "single")
+
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_route_owned_quota_client_is_closed_and_cleared():
+    client = SimpleNamespace(aclose=AsyncMock())
+    consultations._consult_quota_redis = client
+
+    await consultations.close_consult_quota_client()
+
+    client.aclose.assert_awaited_once()
+    assert consultations._consult_quota_redis is None
+
+
+@pytest.mark.asyncio
+async def test_redis_state_closes_only_owned_clients():
+    owned_cache_client = SimpleNamespace(aclose=AsyncMock())
+    injected_cache_client = SimpleNamespace(aclose=AsyncMock())
+    owned_quality_client = SimpleNamespace(aclose=AsyncMock())
+    injected_quality_client = SimpleNamespace(aclose=AsyncMock())
+
+    await RedisResponseCache(owned_cache_client, owns_client=True).close()
+    await RedisResponseCache(injected_cache_client).close()
+    await RedisQualityTracker(
+        owned_quality_client, {"openai": 1.0}, owns_client=True
+    ).close()
+    await RedisQualityTracker(injected_quality_client, {"openai": 1.0}).close()
+
+    owned_cache_client.aclose.assert_awaited_once()
+    owned_quality_client.aclose.assert_awaited_once()
+    injected_cache_client.aclose.assert_not_awaited()
+    injected_quality_client.aclose.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_engine_close_releases_all_resources_and_clears_singleton(monkeypatch):
+    from mnemos.domain.graeae import engine as engine_module
+
+    instance = engine_module.GraeaeEngine.__new__(engine_module.GraeaeEngine)
+    instance._closed = False
+    instance._client = None
+    resources = [SimpleNamespace(close=AsyncMock()) for _ in range(5)]
+    (
+        instance._cache,
+        instance._quality,
+        instance._circuit_breakers,
+        instance._rate_limiters,
+        instance._concurrency,
+    ) = resources
+    engine_module._graeae_engine = instance
+    close_quota = AsyncMock()
+    monkeypatch.setattr(consultations, "close_consult_quota_client", close_quota)
+
+    await instance.close()
+
+    for resource in resources:
+        resource.close.assert_awaited_once()
+    close_quota.assert_awaited_once()
+    assert engine_module._graeae_engine is None
