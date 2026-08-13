@@ -1,51 +1,40 @@
-"""Shared fixtures extracted with the GRAEAE route tests."""
+"""Shared fixtures for the extracted GRAEAE package tests."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 
-class _Transaction:
-    async def __aenter__(self):
-        return MagicMock(name="transaction")
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
+class _ConsultationsRepository:
+    async def create_consultation_with_audit(self, _tx, **_values):
+        return uuid4()
 
 
-class _Consultations:
-    def __init__(self):
-        self.create_consultation_with_audit = AsyncMock(
-            return_value="test-consultation-id"
-        )
-
-
-class _PersistenceBackend:
-    """Small route-level backend; core's full database fake is not extracted."""
-
+class _ConsultationsBackend:
     supports_webhooks = False
 
     def __init__(self):
-        self.consultations = _Consultations()
+        self.consultations = _ConsultationsRepository()
 
-    def transactional(self):
-        return _Transaction()
+    @asynccontextmanager
+    async def transactional(self):
+        yield SimpleNamespace()
 
 
 @pytest.fixture
-def auth_headers():
-    """Return the same headers as the original monorepo fixture."""
+def auth_headers() -> dict[str, str]:
     return {"Authorization": "Bearer test-token-for-testing"}
 
 
 @pytest.fixture
 def mock_graeae_engine():
-    """Return the route test double used before repository extraction."""
     engine = MagicMock()
     engine.consult = AsyncMock(
         return_value={
@@ -63,37 +52,37 @@ def mock_graeae_engine():
             "winning_muse": "openai",
             "cost": 0.02,
             "latency_ms": 1200,
-            "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
-            "memory_ids": ["mem_seed_001"],
+            "timestamp": "2026-08-10T00:00:00",
+            "memory_ids": [],
         }
     )
-    engine.provider_status = MagicMock(return_value={"providers": {}, "cache": {}})
-    engine.providers = {"openai": {"model": "gpt-4o-mini"}}
+    engine.providers = {
+        "openai": {"model": "gpt-4o-mini"},
+        "anthropic": {"model": "claude-3-5-sonnet"},
+    }
     return engine
 
 
 @pytest_asyncio.fixture
 async def client(monkeypatch, mock_graeae_engine):
-    """Create an in-process client without importing core's test-only fakes."""
-    import mnemos.api.routes.consultations as consultation_routes
     import mnemos.core.lifecycle as lifecycle
-    import mnemos.domain.graeae.engine as graeae_engine
     from mnemos.api.dependencies import configure_auth
     from mnemos.api.main import app
+    from mnemos.api.routes import consultations
+    from mnemos.domain.graeae import engine as graeae_engine
 
     configure_auth({"enabled": False})
-    monkeypatch.setenv("MNEMOS_GRAEAE_AUDIT_HMAC_KEY", "graeae-route-test-key")
-    monkeypatch.setattr(lifecycle, "_pool", None)
-    monkeypatch.setattr(lifecycle, "_persistence_backend", _PersistenceBackend())
-    monkeypatch.setattr(lifecycle, "_cache", None)
-    monkeypatch.setattr(lifecycle, "_worker_status", {"distillation_worker": "idle"})
+    monkeypatch.setenv("MNEMOS_GRAEAE_AUDIT_HMAC_KEY", "test-audit-key")
+    monkeypatch.setattr(lifecycle, "_persistence_backend", _ConsultationsBackend())
     monkeypatch.setattr(
-        consultation_routes,
-        "require_consultations_backend",
-        lambda: lifecycle._persistence_backend,
+        consultations,
+        "_get_lifecycle_redis_client",
+        lambda: SimpleNamespace(eval=AsyncMock(return_value=[1, "0", 0])),
+    )
+    monkeypatch.setattr(
+        consultations, "_schedule_outbox_deliveries", lambda _delivery_ids: None
     )
     monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: mock_graeae_engine)
-    app.state.pool = None
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as ac:

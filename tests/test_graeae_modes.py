@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Callable
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
@@ -213,9 +216,7 @@ def _build_engine(
     from mnemos.domain.graeae.engine import GraeaeEngine
 
     monkeypatch.setattr(lc, "_pool", None)
-    monkeypatch.setattr(
-        graeae_engine, "get_elo_weights", lambda force_refresh=False: None
-    )
+    monkeypatch.setattr(graeae_engine, "load_cached_weights", lambda: None)
     engine = GraeaeEngine()
     engine.providers = (
         providers
@@ -365,6 +366,62 @@ async def test_empty_engine_result_returns_502(
 
 
 @pytest.mark.asyncio
+async def test_missing_audit_key_fails_before_provider_dispatch(
+    client: AsyncClient,
+    auth_headers: dict,
+    mock_graeae_engine,
+    monkeypatch,
+):
+    monkeypatch.delenv("MNEMOS_GRAEAE_AUDIT_HMAC_KEY")
+    mock_graeae_engine.consult.reset_mock()
+
+    resp = await client.post(
+        "/v1/consultations",
+        json={"prompt": "do not bill", "task_type": "reasoning"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 503
+    assert "MNEMOS_GRAEAE_AUDIT_HMAC_KEY" in resp.json()["detail"]
+    mock_graeae_engine.consult.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_backend_without_capability_attribute_dispatches_webhook(
+    client: AsyncClient,
+    auth_headers: dict,
+    monkeypatch,
+):
+    import mnemos.core.lifecycle as lifecycle
+
+    consultations_repo = SimpleNamespace(
+        create_consultation_with_audit=AsyncMock(return_value="consultation-1")
+    )
+    webhooks_repo = SimpleNamespace(
+        dispatch_event=AsyncMock(return_value=[])
+    )
+
+    class _Backend:
+        consultations = consultations_repo
+        webhooks = webhooks_repo
+
+        @asynccontextmanager
+        async def transactional(self):
+            yield SimpleNamespace()
+
+    monkeypatch.setattr(lifecycle, "_persistence_backend", _Backend())
+
+    resp = await client.post(
+        "/v1/consultations",
+        json={"prompt": "notify", "task_type": "reasoning"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200, resp.text
+    webhooks_repo.dispatch_event.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_modes_endpoint_lists_all_seven_modes(
     client: AsyncClient,
     auth_headers: dict,
@@ -465,6 +522,50 @@ async def test_debate_mode_runs_three_muses_for_two_rounds(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_debate_round_two_runs_in_parallel(monkeypatch):
+    engine, _calls = _build_engine(monkeypatch)
+    original_worker = engine.provider_worker
+    in_flight = 0
+    max_in_flight = 0
+
+    async def _delayed_worker(request):
+        nonlocal in_flight, max_in_flight
+        if "Round 1 responses from the other muses" in request.params["prompt"]:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.01)
+            result = await original_worker(request)
+            in_flight -= 1
+            return result
+        return await original_worker(request)
+
+    engine.provider_worker = _delayed_worker
+
+    await engine.consult("design the cache", "architecture_design", mode="debate")
+
+    assert max_in_flight == 3
+
+
+def test_debate_peer_context_has_configurable_character_bound(monkeypatch):
+    from mnemos.domain.graeae.engine import _debate_refinement_prompt
+
+    monkeypatch.setenv("MNEMOS_GRAEAE_DEBATE_PEER_CONTEXT_CHARS", "20")
+    rendered = _debate_refinement_prompt(
+        "original",
+        "alpha",
+        {
+            "alpha": {"response_text": "own answer"},
+            "beta": {"response_text": "b" * 100},
+            "gamma": {"response_text": "c" * 100},
+        },
+    )
+    context = rendered.split("Round 1 responses from the other muses:\n", 1)[1]
+    context = context.split("\n\nRefine your answer.", 1)[0]
+
+    assert len(context) == 20
+
+
+@pytest.mark.asyncio
 async def test_majority_mode_reports_quorum_reached(monkeypatch):
     engine, calls = _build_engine(
         monkeypatch,
@@ -472,14 +573,12 @@ async def test_majority_mode_reports_quorum_reached(monkeypatch):
             "alpha": "approve the design because it has a stable cache boundary",
             "beta": "approve the design because it has a stable cache boundary",
             "gamma": "approve the design because it has a stable cache boundary",
+            "delta": "approve the design because it has a stable cache boundary",
         },
     )
 
     result = await engine.consult("approve?", "architecture_design", mode="majority")
 
-    # Majority intentionally uses up to five ranked muses. This fixture has four,
-    # so the dissenting fourth response participates while the three matching
-    # responses still satisfy the 66% quorum.
     assert [call["provider"] for call in calls] == [
         "alpha",
         "beta",
@@ -579,6 +678,22 @@ async def test_local_mode_queries_only_local_muses(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cache_separates_external_and_local_modes(monkeypatch):
+    engine, calls = _build_engine(monkeypatch, providers=_scoped_providers())
+
+    external = await engine.consult("same prompt", "reasoning", mode="external")
+    local = await engine.consult("same prompt", "reasoning", mode="local")
+
+    assert set(external["all_responses"]) == {
+        "cloud_openai",
+        "cloud_xai",
+        "shim_openai",
+    }
+    assert set(local["all_responses"]) == {"lan_cerberus", "lan_hydra"}
+    assert {call["provider"] for call in calls} == set(_scoped_providers())
+
+
+@pytest.mark.asyncio
 async def test_all_mode_queries_every_muse_regardless_of_scope(monkeypatch):
     engine, _calls = _build_engine(monkeypatch, providers=_scoped_providers())
 
@@ -619,6 +734,63 @@ async def test_consult_runs_independent_provider_state_checks_in_parallel(monkey
     assert concurrency.released.max_in_flight > 1
     assert quality.successes.max_in_flight > 1
     assert quality.dynamic_weight_calls == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_returns_paid_result_when_quality_recording_fails(monkeypatch):
+    import mnemos.domain.graeae.engine as graeae_engine
+
+    engine, _calls = _build_engine(monkeypatch)
+    monkeypatch.setattr(graeae_engine, "get_key", lambda _name: "test-key")
+    engine._quality.record_success = AsyncMock(
+        side_effect=ConnectionError("redis failed after provider response")
+    )
+
+    result = await engine.route(
+        "alpha",
+        "alpha-model",
+        "paid request",
+        task_type="reasoning",
+    )
+
+    assert result["status"] == "success"
+    assert result["response_text"] == "alpha response to paid request"
+
+
+@pytest.mark.asyncio
+async def test_quorum_cancelled_provider_does_not_record_success(monkeypatch):
+    engine, _calls = _build_engine(monkeypatch)
+    quality = _ParallelQuality(
+        {name: cfg["weight"] for name, cfg in engine.providers.items()}
+    )
+    breaker = _ParallelBreaker()
+    engine._quality = quality
+    engine._circuit_breakers = breaker
+
+    original_worker = engine.provider_worker
+
+    async def _worker(request):
+        if request.provider == "delta":
+            await asyncio.Event().wait()
+        return await original_worker(request)
+
+    engine.provider_worker = _worker
+
+    real_wait = asyncio.wait
+
+    async def _short_wait(tasks, *, return_when, timeout=None):
+        return await real_wait(tasks, return_when=return_when, timeout=0.02)
+
+    monkeypatch.setattr(asyncio, "wait", _short_wait)
+
+    result = await engine.consult("fast quorum", "reasoning", mode="all")
+
+    assert result["all_responses"]["delta"]["status"] == "cancelled"
+    assert result["all_responses"]["delta"]["final_score"] == 0.0
+    assert "delta" not in breaker.successes.calls
+    assert "delta" not in breaker.failures.calls
+    assert "delta" not in quality.successes.calls
+    assert "delta" not in quality.failures.calls
 
 
 @pytest.mark.asyncio

@@ -9,15 +9,60 @@ with a perfect recent track record keeps its full configured weight, while a
 flaky one is deprioritised without being removed from the pool entirely
 (the circuit breaker handles full removal).
 """
+import logging
 import threading
 from collections import deque
 from enum import IntEnum
 from typing import Any, Callable, Optional
 from datetime import datetime
 
+from mnemos.core.resilience import (
+    _redis_storage_uri,
+    _warn_fallback,
+)
+
+logger = logging.getLogger(__name__)
+
 _WINDOW = 20  # rolling window size (number of outcomes)
 _CAPABILITY_TTL_SECONDS = 1800
 _BREAKER_COOLDOWN_SECONDS = 300
+_REDIS_KEY_PREFIX = "mnemos:graeae:quality:"
+_EWMA_ALPHA = 0.2
+
+_REDIS_QUALITY_EWMA_LUA = """
+local key = KEYS[1]
+local outcome = tonumber(ARGV[1])
+local latency = tonumber(ARGV[2])
+local alpha = tonumber(ARGV[3])
+local base_weight = tonumber(ARGV[4])
+
+local old_success = redis.call('ZSCORE', key, 'success_ewma')
+local success
+if old_success then
+  success = (alpha * outcome) + ((1 - alpha) * tonumber(old_success))
+else
+  success = outcome
+end
+
+redis.call('ZADD', key, success, 'success_ewma')
+redis.call('ZADD', key, base_weight, 'base_weight')
+
+local latency_ewma = redis.call('ZSCORE', key, 'latency_ewma')
+if latency >= 0 then
+  if latency_ewma then
+    latency_ewma = (alpha * latency) + ((1 - alpha) * tonumber(latency_ewma))
+  else
+    latency_ewma = latency
+  end
+  redis.call('ZADD', key, latency_ewma, 'latency_ewma')
+elseif latency_ewma then
+  latency_ewma = tonumber(latency_ewma)
+else
+  latency_ewma = 0
+end
+
+return {success, latency_ewma}
+"""
 
 
 class Classification(IntEnum):
@@ -344,26 +389,187 @@ class QualityTracker:
             self._flush_callback(dirty_providers)
 
 
+class RedisQualityTracker(QualityTracker):
+    """Redis sorted-set EWMA quality tracker shared across workers."""
+
+    def __init__(
+        self,
+        redis_client: Any,
+        provider_weights: dict[str, float],
+        *,
+        key_prefix: str = _REDIS_KEY_PREFIX,
+        alpha: float = _EWMA_ALPHA,
+        owns_client: bool = False,
+        fallback: QualityTracker | None = None,
+    ):
+        self.redis = redis_client
+        self.provider_weights = dict(provider_weights)
+        self.key_prefix = key_prefix
+        self.alpha = alpha
+        self._owns_client = owns_client
+        self._fallback = fallback
+        self._degraded = False
+        self._last_error: str | None = None
+        self._last_status: dict[str, dict[str, float | int]] = {
+            provider: {
+                "dynamic_weight": weight,
+                "base_weight": weight,
+                "avg_latency_ms": 0,
+            }
+            for provider, weight in self.provider_weights.items()
+        }
+
+    def _key(self, provider: str) -> str:
+        return f"{self.key_prefix}{provider}"
+
+    def _redis_failed(self, operation: str, exc: Exception) -> None:
+        self._degraded = True
+        self._last_error = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "Redis quality tracker %s failed; using in-process fallback: %s",
+            operation,
+            exc,
+        )
+
+    def _redis_succeeded(self) -> None:
+        self._degraded = False
+        self._last_error = None
+
+    async def _record(
+        self,
+        provider: str,
+        *,
+        outcome: float,
+        latency_ms: int,
+    ) -> float | None:
+        if provider not in self.provider_weights:
+            return None
+        base_weight = float(self.provider_weights[provider])
+        if self._fallback is not None:
+            if outcome:
+                self._fallback.record_success(provider, latency_ms)
+            else:
+                self._fallback.record_failure(provider)
+        try:
+            result = await self.redis.eval(
+                _REDIS_QUALITY_EWMA_LUA,
+                1,
+                self._key(provider),
+                float(outcome),
+                int(latency_ms),
+                float(self.alpha),
+                base_weight,
+            )
+            self._redis_succeeded()
+        except Exception as exc:
+            if self._fallback is None:
+                raise
+            self._redis_failed("record", exc)
+            return self._fallback.dynamic_weight(provider)
+        success_ewma = (
+            float(result[0]) if isinstance(result, (list, tuple)) else float(result)
+        )
+        latency_ewma = (
+            float(result[1])
+            if isinstance(result, (list, tuple)) and len(result) > 1
+            else 0.0
+        )
+        dynamic_weight = round(base_weight * (0.5 + 0.5 * success_ewma), 4)
+        self._last_status[provider] = {
+            "dynamic_weight": dynamic_weight,
+            "base_weight": base_weight,
+            "avg_latency_ms": int(latency_ewma),
+        }
+        return dynamic_weight
+
+    async def record_success(self, provider: str, latency_ms: int) -> float | None:
+        return await self._record(provider, outcome=1.0, latency_ms=latency_ms)
+
+    async def record_failure(self, provider: str) -> None:
+        await self._record(provider, outcome=0.0, latency_ms=-1)
+
+    async def dynamic_weight(self, provider: str) -> float:
+        base_weight = float(self.provider_weights.get(provider, 0.0))
+        if base_weight == 0.0:
+            return 0.0
+        try:
+            raw = await self.redis.zscore(self._key(provider), "success_ewma")
+            self._redis_succeeded()
+        except Exception as exc:
+            if self._fallback is None:
+                raise
+            self._redis_failed("read", exc)
+            return self._fallback.dynamic_weight(provider)
+        if raw is None:
+            return base_weight
+        score = float(raw)
+        weight = round(base_weight * (0.5 + 0.5 * score), 4)
+        current = self._last_status.setdefault(
+            provider,
+            {"dynamic_weight": weight, "base_weight": base_weight, "avg_latency_ms": 0},
+        )
+        current["dynamic_weight"] = weight
+        current["base_weight"] = base_weight
+        return weight
+
+    def status(self) -> dict:
+        return dict(self._last_status)
+
+    def backend_status(self) -> dict[str, Any]:
+        return {
+            "backend": "redis",
+            "degraded": self._degraded,
+            "fallback_backend": "in_process" if self._fallback is not None else None,
+            "last_error": self._last_error,
+        }
+
+    async def close(self) -> None:
+        if not self._owns_client:
+            return
+        close = getattr(self.redis, "aclose", None) or getattr(self.redis, "close", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+
+
 def make_quality_tracker(
     settings: Any,
     provider_weights: dict[str, float],
     *,
     redis_client: Any | None = None,
-) -> QualityTracker:
-    """Factory function to create a quality tracker."""
-    if redis_client is not None:
-        # Return RedisQualityTracker if Redis client provided
-        return RedisQualityTracker(provider_weights, redis_client)
+) -> QualityTracker | RedisQualityTracker:
+    redis_uri = _redis_storage_uri(settings)
+    if redis_uri:
+        client = redis_client
+        owns_client = False
+        if client is None:
+            try:
+                import redis.asyncio as redis
+
+                client = redis.from_url(redis_uri, decode_responses=True)
+                owns_client = True
+            except ImportError:
+                _warn_fallback(
+                    settings,
+                    "Redis quality tracker requested but redis-py is unavailable",
+                )
+        if client is not None:
+            allow_fallback = bool(
+                getattr(
+                    getattr(settings, "resilience", None),
+                    "allow_in_process_fallback",
+                    False,
+                )
+            )
+            fallback = QualityTracker(provider_weights) if allow_fallback else None
+            return RedisQualityTracker(
+                client,
+                provider_weights,
+                owns_client=owns_client,
+                fallback=fallback,
+            )
+        _warn_fallback(settings, "Redis quality tracker requested but unavailable")
     else:
-        # Return regular QualityTracker
-        return QualityTracker(provider_weights)
-
-
-class RedisQualityTracker(QualityTracker):
-    """Redis-backed quality tracker for persistence."""
-    
-    def __init__(self, provider_weights: dict[str, float], redis_client: Any, flush_callback: Optional[Callable[[dict], None]] = None):
-        super().__init__(provider_weights, flush_callback)
-        self._redis_client = redis_client
-        # In a real implementation, this would load from Redis and save to Redis
-        # For now, we'll keep the same structure but with Redis integration
+        _warn_fallback(settings, "No Redis quality-tracker backend configured")
+    return QualityTracker(provider_weights)

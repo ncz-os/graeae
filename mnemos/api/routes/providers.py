@@ -52,7 +52,7 @@ async def provider_health(
         raise HTTPException(status_code=503, detail="Health check failed")
 
 
-@router.get("/providers/recommend")
+@router.get("/providers/graeae/recommend")
 async def recommend_model(
     task_type: str = Query(..., description="Task type: code_generation, reasoning, architecture_design, etc."),
     cost_budget: float = Query(10.0, description="Max cost per 1M tokens ($/MTok)"),

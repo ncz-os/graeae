@@ -6,17 +6,21 @@
 
 import hashlib
 import hmac
+
+from mnemos.core import audit_chain
 import logging
 import os
+import threading
 import time
-from collections import defaultdict, deque
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import require_consultations_backend
+from mnemos.core.config import get_settings
 from mnemos.core.rate_limit import limiter
+from mnemos.core.resilience import _redis_storage_uri
 from mnemos.core.security import is_root, scope_namespace
 from mnemos.domain.graeae.engine import _REGISTRY_MAP
 from mnemos.domain.models import (
@@ -120,9 +124,48 @@ _MODE_COST_WEIGHT = {
     "debate": 8.0,
 }
 _QUOTA_WINDOW_SECONDS = 60.0
-# user_id -> deque[(monotonic_ts, weight)]. Bounded by active principals;
-# empty buckets are pruned opportunistically below.
-_consult_usage: dict[str, deque] = defaultdict(deque)
+_QUOTA_KEY_PREFIX = "mnemos:graeae:consult-quota:"
+_consult_quota_redis = None
+_consult_quota_local: dict[str, list[tuple[float, float]]] = {}
+_consult_quota_local_lock = threading.Lock()
+_CONSULT_QUOTA_GC_INTERVAL = 256
+_CONSULT_QUOTA_MAX_BUCKETS = 4096
+_consult_quota_gc_touches = 0
+
+_CONSULT_QUOTA_LUA = """
+local key = KEYS[1]
+local sequence_key = KEYS[2]
+local weight = tonumber(ARGV[1])
+local quota = tonumber(ARGV[2])
+local window_ms = tonumber(ARGV[3])
+local redis_time = redis.call('TIME')
+local now_ms = (tonumber(redis_time[1]) * 1000) + math.floor(tonumber(redis_time[2]) / 1000)
+local cutoff = now_ms - window_ms
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+local used = 0
+local members = redis.call('ZRANGE', key, 0, -1)
+for _, member in ipairs(members) do
+  local separator = string.find(member, ':', 1, true)
+  used = used + tonumber(string.sub(member, 1, separator - 1))
+end
+
+if used + weight > quota then
+  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  local retry_ms = window_ms
+  if #oldest == 2 then
+    retry_ms = math.max(1, tonumber(oldest[2]) + window_ms - now_ms)
+  end
+  return {0, tostring(used), retry_ms}
+end
+
+local sequence = redis.call('INCR', sequence_key)
+local member = tostring(weight) .. ':' .. tostring(now_ms) .. ':' .. tostring(sequence)
+redis.call('ZADD', key, now_ms, member)
+redis.call('PEXPIRE', key, window_ms)
+redis.call('PEXPIRE', sequence_key, window_ms)
+return {1, tostring(used + weight), 0}
+"""
 
 
 def _consult_quota_per_min() -> float:
@@ -132,25 +175,159 @@ def _consult_quota_per_min() -> float:
         return 20.0
 
 
-def _enforce_consult_quota(user_id: str, mode: str) -> None:
-    """Cost-weighted per-principal quota. Raises 429 when the window is full.
+def _get_lifecycle_redis_client():
+    """Return the route-owned Redis client selected by core resilience config.
 
-    Synchronous (no awaits) so the read-modify-write of the bucket is atomic
-    within the event loop; keying is the SERVER-derived user_id, never a
-    client-supplied value.
+    Core no longer exposes a lifecycle Redis client. Its current Redis
+    resilience backends derive the connection from ``rate_limit.storage_uri``
+    and own their client, so this route follows the same model. The historical
+    function name remains as a narrow compatibility seam for callers that
+    inject a test client.
     """
+    global _consult_quota_redis
+    if _consult_quota_redis is not None:
+        return _consult_quota_redis
+    redis_uri = _redis_storage_uri(get_settings())
+    if not redis_uri:
+        return None
+    try:
+        import redis.asyncio as redis
+    except ImportError:
+        return None
+    _consult_quota_redis = redis.from_url(redis_uri, decode_responses=True)
+    return _consult_quota_redis
+
+
+def _single_worker_memory_quota_enabled(settings) -> bool:
+    """Return whether this is an explicitly local, single-worker profile."""
+    profile = str(getattr(getattr(settings, "server", None), "profile", "") or "").lower()
+    if profile == "personal":
+        profile = "edge"
+    workers = int(getattr(getattr(settings, "server", None), "workers", 1) or 1)
+    storage_uri = str(
+        getattr(getattr(settings, "rate_limit", None), "storage_uri", "") or ""
+    ).lower()
+    return profile in {"edge", "dev"} and workers == 1 and storage_uri == "memory://"
+
+
+def _gc_local_consult_quota(*, cutoff: float) -> None:
+    """Drop idle local quota buckets while holding the quota lock."""
+    stale = [
+        principal
+        for principal, entries in _consult_quota_local.items()
+        if not entries or entries[-1][0] <= cutoff
+    ]
+    for principal in stale:
+        _consult_quota_local.pop(principal, None)
+
+
+def _evict_oldest_local_consult_quota(*, target_size: int) -> None:
+    """Bound local fallback memory by evicting least-recently-used buckets."""
+    if len(_consult_quota_local) <= target_size:
+        return
+    oldest_first = sorted(
+        _consult_quota_local.items(),
+        key=lambda item: item[1][-1][0] if item[1] else float("-inf"),
+    )
+    for principal, _entries in oldest_first[: len(_consult_quota_local) - target_size]:
+        _consult_quota_local.pop(principal, None)
+
+
+def _enforce_local_consult_quota(principal: str, weight: float, quota: float) -> None:
+    """Atomically enforce quota for supported single-process deployments."""
+    global _consult_quota_gc_touches
+    now = time.monotonic()
+    cutoff = now - _QUOTA_WINDOW_SECONDS
+    with _consult_quota_local_lock:
+        _consult_quota_gc_touches += 1
+        if _consult_quota_gc_touches >= _CONSULT_QUOTA_GC_INTERVAL:
+            _consult_quota_gc_touches = 0
+            _gc_local_consult_quota(cutoff=cutoff)
+
+        # Enforce the cap before creating a new principal bucket. Run a stale
+        # sweep first even between periodic sweeps, then evict the oldest half
+        # if high-cardinality churn still fills the map.
+        if principal not in _consult_quota_local and len(_consult_quota_local) >= _CONSULT_QUOTA_MAX_BUCKETS:
+            _gc_local_consult_quota(cutoff=cutoff)
+            if len(_consult_quota_local) >= _CONSULT_QUOTA_MAX_BUCKETS:
+                _evict_oldest_local_consult_quota(
+                    target_size=max(0, _CONSULT_QUOTA_MAX_BUCKETS // 2)
+                )
+
+        entries = [entry for entry in _consult_quota_local.get(principal, []) if entry[0] > cutoff]
+        used = sum(entry[1] for entry in entries)
+        if used + weight > quota:
+            retry = max(1, int(entries[0][0] + _QUOTA_WINDOW_SECONDS - now) + 1) if entries else 1
+            _consult_quota_local[principal] = entries
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"GRAEAE consultation quota exceeded for this principal "
+                    f"({used:.0f}+{weight:.0f} > {quota:.0f} cost-units/min)"
+                ),
+                headers={"Retry-After": str(retry)},
+            )
+        entries.append((now, weight))
+        _consult_quota_local[principal] = entries
+
+
+async def close_consult_quota_client() -> None:
+    """Close and clear the route-owned Redis client during lifespan teardown."""
+    global _consult_quota_gc_touches, _consult_quota_redis
+    with _consult_quota_local_lock:
+        _consult_quota_local.clear()
+        _consult_quota_gc_touches = 0
+    client, _consult_quota_redis = _consult_quota_redis, None
+    if client is None:
+        return
+    close = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if close is not None:
+        result = close()
+        if hasattr(result, "__await__"):
+            await result
+
+
+async def _enforce_consult_quota(user_id: str, mode: str) -> None:
+    """Atomically enforce the shared, cost-weighted per-principal quota."""
     quota = _consult_quota_per_min()
     if quota <= 0:
         return
     weight = _MODE_COST_WEIGHT.get((mode or "auto").lower(), 2.0)
-    now = time.monotonic()
-    cutoff = now - _QUOTA_WINDOW_SECONDS
-    bucket = _consult_usage[str(user_id or "anonymous")]
-    while bucket and bucket[0][0] < cutoff:
-        bucket.popleft()
-    used = sum(w for _, w in bucket)
-    if used + weight > quota:
-        retry = max(1, int(bucket[0][0] + _QUOTA_WINDOW_SECONDS - now)) if bucket else int(_QUOTA_WINDOW_SECONDS)
+    settings = get_settings()
+    principal = hashlib.sha256(str(user_id or "anonymous").encode()).hexdigest()
+    redis = _get_lifecycle_redis_client()
+    if redis is None:
+        if _single_worker_memory_quota_enabled(settings):
+            _enforce_local_consult_quota(principal, weight, quota)
+            return
+        raise HTTPException(
+            status_code=503,
+            detail="Shared consultation quota storage is unavailable.",
+        )
+
+    key = f"{_QUOTA_KEY_PREFIX}{principal}"
+    try:
+        allowed, used_raw, retry_ms = await redis.eval(
+            _CONSULT_QUOTA_LUA,
+            2,
+            key,
+            f"{key}:sequence",
+            weight,
+            quota,
+            int(_QUOTA_WINDOW_SECONDS * 1000),
+        )
+    except Exception as exc:
+        logger.error("[CONSULTATION] shared quota check failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Shared consultation quota storage is unavailable.",
+        ) from exc
+
+    if not int(allowed):
+        if isinstance(used_raw, bytes):
+            used_raw = used_raw.decode()
+        used = float(used_raw)
+        retry = max(1, (int(retry_ms) + 999) // 1000)
         raise HTTPException(
             status_code=429,
             detail=(
@@ -159,9 +336,6 @@ def _enforce_consult_quota(user_id: str, mode: str) -> None:
             ),
             headers={"Retry-After": str(retry)},
         )
-    bucket.append((now, weight))
-    if not bucket:  # pragma: no cover - defensive prune
-        _consult_usage.pop(str(user_id or "anonymous"), None)
 
 
 def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
@@ -451,7 +625,10 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
     # SECURITY (review #12): cost-weighted per-principal quota, BEFORE any
     # provider fan-out, so a single caller cannot turn 60 req/min of
     # mode=all/debate into a financial DoS.
-    _enforce_consult_quota(user.user_id, body.mode)
+    await _enforce_consult_quota(user.user_id, body.mode)
+    # Validate the signing key before provider fan-out incurs cost. The same
+    # precomputed genesis is passed to persistence after the provider returns.
+    genesis_hash = audit_genesis_hash()
     try:
         backend = require_consultations_backend()
         from mnemos.domain.graeae.engine import get_graeae_engine
@@ -486,8 +663,17 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                     resp["truncated"] = original_len > body.limit_chars
 
         if body.format == "best" and result.get("all_responses"):
-            best = max(result["all_responses"].items(), key=lambda x: x[1].get("final_score", 0))
-            result["all_responses"] = {best[0]: best[1]}
+            successful = [
+                item
+                for item in result["all_responses"].items()
+                if item[1].get("status") == "success"
+            ]
+            best = max(
+                successful,
+                key=lambda item: item[1].get("final_score", 0),
+                default=None,
+            )
+            result["all_responses"] = {best[0]: best[1]} if best else {}
 
         consultation_id = None
         memory_ids = _extract_memory_ids(result)
@@ -538,9 +724,15 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                         # create_consultation_with_audit must adopt
                         # compute_audit_chain_hash for the per-link MAC too, else
                         # verify() below will (correctly) report the chain unsigned.
-                        genesis_hash=audit_genesis_hash(),
+                        genesis_hash=genesis_hash,
+                        # Core signs each link with the same key the verifier
+                        # below uses. Without this the writer fell back to an
+                        # unkeyed 3-field SHA-256 and verify() reported the
+                        # chain unsigned -- the failure the comment above
+                        # predicted.
+                        audit_key=_audit_hmac_key(),
                     )
-                    if backend.supports_webhooks:
+                    if getattr(backend, "supports_webhooks", True):
                         delivery_ids = await backend.webhooks.dispatch_event(
                             tx,
                             "consultation.completed",
@@ -698,7 +890,14 @@ async def verify_audit_chain(
         prev_chain = audit_genesis_hash()
         failures: dict[int, str] = {}
         for row in rows:
-            expected = compute_audit_chain_hash(
+            # Verify each row under the algorithm that SIGNED it. Rows written
+            # before the chain was versioned carry NULL/sha256-v1 and are
+            # verified with the legacy unkeyed hash; re-signing them under v2
+            # would make them verify at the cost of destroying the tamper
+            # evidence the log exists to provide.
+            expected = audit_chain.compute_for_algo(
+                row.get("chain_algo"),
+                key=_audit_hmac_key(),
                 prev_chain_hash=prev_chain,
                 prompt_hash=row["prompt_hash"],
                 response_hash=row["response_hash"],
@@ -864,7 +1063,7 @@ async def list_modes(_: UserContext = Depends(get_current_user)):
             },
             {
                 "name": "majority",
-                "description": "fan out to up to three muses and report whether quorum agreement was reached",
+                "description": "fan out to up to five muses and report whether quorum agreement was reached",
             },
         ],
         "validation": {
