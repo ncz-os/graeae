@@ -6,6 +6,8 @@
 
 import hashlib
 import hmac
+
+from mnemos.core import audit_chain
 import logging
 import os
 import threading
@@ -723,6 +725,12 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                         # compute_audit_chain_hash for the per-link MAC too, else
                         # verify() below will (correctly) report the chain unsigned.
                         genesis_hash=genesis_hash,
+                        # Core signs each link with the same key the verifier
+                        # below uses. Without this the writer fell back to an
+                        # unkeyed 3-field SHA-256 and verify() reported the
+                        # chain unsigned -- the failure the comment above
+                        # predicted.
+                        audit_key=_audit_hmac_key(),
                     )
                     if getattr(backend, "supports_webhooks", True):
                         delivery_ids = await backend.webhooks.dispatch_event(
@@ -882,7 +890,14 @@ async def verify_audit_chain(
         prev_chain = audit_genesis_hash()
         failures: dict[int, str] = {}
         for row in rows:
-            expected = compute_audit_chain_hash(
+            # Verify each row under the algorithm that SIGNED it. Rows written
+            # before the chain was versioned carry NULL/sha256-v1 and are
+            # verified with the legacy unkeyed hash; re-signing them under v2
+            # would make them verify at the cost of destroying the tamper
+            # evidence the log exists to provide.
+            expected = audit_chain.compute_for_algo(
+                row.get("chain_algo"),
+                key=_audit_hmac_key(),
                 prev_chain_hash=prev_chain,
                 prompt_hash=row["prompt_hash"],
                 response_hash=row["response_hash"],
