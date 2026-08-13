@@ -216,9 +216,7 @@ def _build_engine(
     from mnemos.domain.graeae.engine import GraeaeEngine
 
     monkeypatch.setattr(lc, "_pool", None)
-    monkeypatch.setattr(
-        graeae_engine, "get_elo_weights", lambda force_refresh=False: None
-    )
+    monkeypatch.setattr(graeae_engine, "load_cached_weights", lambda: None)
     engine = GraeaeEngine()
     engine.providers = (
         providers
@@ -521,6 +519,50 @@ async def test_debate_mode_runs_three_muses_for_two_rounds(monkeypatch):
     assert set(result["round_1"]) == {"alpha", "beta", "gamma"}
     assert set(result["round_2"]) == {"alpha", "beta", "gamma"}
     assert set(result["all_responses"]) == {"alpha", "beta", "gamma"}
+
+
+@pytest.mark.asyncio
+async def test_debate_round_two_runs_in_parallel(monkeypatch):
+    engine, _calls = _build_engine(monkeypatch)
+    original_worker = engine.provider_worker
+    in_flight = 0
+    max_in_flight = 0
+
+    async def _delayed_worker(request):
+        nonlocal in_flight, max_in_flight
+        if "Round 1 responses from the other muses" in request.params["prompt"]:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.01)
+            result = await original_worker(request)
+            in_flight -= 1
+            return result
+        return await original_worker(request)
+
+    engine.provider_worker = _delayed_worker
+
+    await engine.consult("design the cache", "architecture_design", mode="debate")
+
+    assert max_in_flight == 3
+
+
+def test_debate_peer_context_has_configurable_character_bound(monkeypatch):
+    from mnemos.domain.graeae.engine import _debate_refinement_prompt
+
+    monkeypatch.setenv("MNEMOS_GRAEAE_DEBATE_PEER_CONTEXT_CHARS", "20")
+    rendered = _debate_refinement_prompt(
+        "original",
+        "alpha",
+        {
+            "alpha": {"response_text": "own answer"},
+            "beta": {"response_text": "b" * 100},
+            "gamma": {"response_text": "c" * 100},
+        },
+    )
+    context = rendered.split("Round 1 responses from the other muses:\n", 1)[1]
+    context = context.split("\n\nRefine your answer.", 1)[0]
+
+    assert len(context) == 20
 
 
 @pytest.mark.asyncio

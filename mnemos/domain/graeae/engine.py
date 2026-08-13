@@ -59,7 +59,7 @@ from mnemos.domain.providers import _PROVIDER_ENV_VARS, get_key
 
 from mnemos.domain.graeae._cache import make_response_cache
 from mnemos.domain.graeae._quality import make_quality_tracker
-from mnemos.domain.graeae.elo_sync import get_elo_weights
+from mnemos.domain.graeae.elo_sync import load_cached_weights
 from mnemos.domain.graeae.provider_worker import (
     LocalProviderWorker,
     ProviderQueryRequest,
@@ -80,6 +80,7 @@ def _env_var_hint(key_name: str) -> str:
 _DEFAULT_MAX_OUTPUT_TOKENS = 8192
 _DEFAULT_MAX_CANDIDATES = 1
 _DEFAULT_RANKED_LINEUP_TTL_SECONDS = 60
+_DEFAULT_DEBATE_PEER_CONTEXT_CHARS = 64 * 1024
 _RANKED_LINEUP_CACHE_MAX_ENTRIES = 128
 _MAX_STOP_SEQUENCES = 4
 _MAX_STOP_SEQUENCE_CHARS = 512
@@ -585,6 +586,13 @@ def _ranked_lineup_ttl_seconds() -> int:
     )
 
 
+def _debate_peer_context_chars() -> int:
+    return _positive_int_env(
+        "MNEMOS_GRAEAE_DEBATE_PEER_CONTEXT_CHARS",
+        _DEFAULT_DEBATE_PEER_CONTEXT_CHARS,
+    )
+
+
 class _RankedLineupCache:
     """Thread-safe TTL/LRU cache for model_registry ranking lookups."""
 
@@ -739,7 +747,7 @@ class GraeaeEngine:
 
         # Seed base weights from Arena.ai Elo leaderboard if available.
         # Uses on-disk cache — falls back to config.toml weights silently.
-        elo = get_elo_weights(force_refresh=False)
+        elo = load_cached_weights()
         if elo:
             for name, w in elo.items():
                 if name in self.providers:
@@ -1386,8 +1394,9 @@ class GraeaeEngine:
                 **_compute_consensus(round_1_responses),
             }
 
-        round_2_responses: Dict[str, Dict] = {}
-        for provider_name, model_override in lineup.items():
+        async def _refine(
+            provider_name: str, model_override: Optional[str]
+        ) -> tuple[str, Dict]:
             refine_prompt = _debate_refinement_prompt(
                 prompt=prompt,
                 current_muse=provider_name,
@@ -1400,9 +1409,19 @@ class GraeaeEngine:
                 selection={provider_name: model_override},
                 mode="all",
             )
-            round_2_responses[provider_name] = refined.get("all_responses", {}).get(
+            response = refined.get("all_responses", {}).get(
                 provider_name
             ) or _unavailable(self.providers[provider_name]["model"])
+            return provider_name, response
+
+        round_2_responses = dict(
+            await asyncio.gather(
+                *(
+                    _refine(provider_name, model_override)
+                    for provider_name, model_override in lineup.items()
+                )
+            )
+        )
 
         consensus = _compute_consensus(round_2_responses)
         return {
@@ -2311,6 +2330,7 @@ def _debate_refinement_prompt(
     context = (
         "\n\n".join(others) if others else "No other round-1 responses were available."
     )
+    context = context[:_debate_peer_context_chars()]
     return (
         "Original consultation prompt:\n"
         f"{prompt}\n\n"

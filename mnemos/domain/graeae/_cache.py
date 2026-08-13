@@ -13,11 +13,13 @@ Key design choices:
   comparable to skipping the cache for the less-common near-duplicate case.
 - TTL-based expiry (default 1 hour). Architectural questions don't change
   minute-to-minute; caching them avoids redundant API spend.
-- LRU eviction at max_entries to bound memory usage.
+- LRU eviction at max_entries and MNEMOS_GRAEAE_CACHE_MAX_BYTES (32 MiB by
+  default) to bound memory usage by both entry count and serialized size.
 """
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from copy import deepcopy
@@ -33,16 +35,32 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TTL = 3600   # seconds
 _MAX_ENTRIES = 500
+_DEFAULT_MAX_BYTES = 32 * 1024 * 1024
 _REDIS_KEY_PREFIX = "mnemos:graeae:cache:"
 
 
-class ResponseCache:
-    """Thread-safe LRU cache for GRAEAE consensus responses."""
+def _max_bytes_from_env() -> int:
+    try:
+        value = int(os.getenv("MNEMOS_GRAEAE_CACHE_MAX_BYTES", ""))
+    except ValueError:
+        return _DEFAULT_MAX_BYTES
+    return value if value > 0 else _DEFAULT_MAX_BYTES
 
-    def __init__(self, ttl_seconds: int = _DEFAULT_TTL, max_entries: int = _MAX_ENTRIES):
+
+class ResponseCache:
+    """Thread-safe entry- and byte-bounded LRU cache for GRAEAE responses."""
+
+    def __init__(
+        self,
+        ttl_seconds: int = _DEFAULT_TTL,
+        max_entries: int = _MAX_ENTRIES,
+        max_bytes: int | None = None,
+    ):
         self.ttl = ttl_seconds
         self.max_entries = max_entries
-        self._store: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+        self.max_bytes = max_bytes if max_bytes is not None else _max_bytes_from_env()
+        self._store: OrderedDict[str, tuple[float, Any, int]] = OrderedDict()
+        self._bytes = 0
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
@@ -57,9 +75,10 @@ class ResponseCache:
             if key not in self._store:
                 self._misses += 1
                 return None
-            stored_at, value = self._store[key]
+            stored_at, value, size = self._store[key]
             if time.monotonic() - stored_at > self.ttl:
                 del self._store[key]
+                self._bytes -= size
                 self._misses += 1
                 return None
             self._store.move_to_end(key)
@@ -68,17 +87,34 @@ class ResponseCache:
 
     def set(self, prompt: str, task_type: str, value: Any, model: str = "") -> None:
         key = self._key(prompt, task_type, model)
+        cached_value = deepcopy(value)
+        size = len(
+            json.dumps(
+                cached_value, separators=(",", ":"), sort_keys=True, default=str
+            ).encode("utf-8")
+        )
         with self._lock:
-            self._store[key] = (time.monotonic(), deepcopy(value))
+            previous = self._store.pop(key, None)
+            if previous is not None:
+                self._bytes -= previous[2]
+            if size > self.max_bytes:
+                return
+            self._store[key] = (time.monotonic(), cached_value, size)
+            self._bytes += size
             self._store.move_to_end(key)
-            while len(self._store) > self.max_entries:
-                self._store.popitem(last=False)
+            while len(self._store) > self.max_entries or self._bytes > self.max_bytes:
+                _evicted_key, (_stored_at, _value, evicted_size) = self._store.popitem(
+                    last=False
+                )
+                self._bytes -= evicted_size
 
     def stats(self) -> dict:
         with self._lock:
             total = self._hits + self._misses
             return {
                 "entries": len(self._store),
+                "bytes": self._bytes,
+                "max_bytes": self.max_bytes,
                 "hits": self._hits,
                 "misses": self._misses,
                 "hit_rate": round(self._hits / total, 3) if total else 0.0,
@@ -213,6 +249,7 @@ def make_response_cache(
     *,
     ttl_seconds: int = _DEFAULT_TTL,
     max_entries: int = _MAX_ENTRIES,
+    max_bytes: int | None = None,
     redis_client: Any | None = None,
 ) -> ResponseCache | RedisResponseCache:
     redis_uri = _redis_storage_uri(settings)
@@ -239,7 +276,11 @@ def make_response_cache(
                 )
             )
             fallback = (
-                ResponseCache(ttl_seconds=ttl_seconds, max_entries=max_entries)
+                ResponseCache(
+                    ttl_seconds=ttl_seconds,
+                    max_entries=max_entries,
+                    max_bytes=max_bytes,
+                )
                 if allow_fallback
                 else None
             )
@@ -252,4 +293,8 @@ def make_response_cache(
         _warn_fallback(settings, "Redis response cache requested but unavailable")
     else:
         _warn_fallback(settings, "No Redis response-cache backend configured")
-    return ResponseCache(ttl_seconds=ttl_seconds, max_entries=max_entries)
+    return ResponseCache(
+        ttl_seconds=ttl_seconds,
+        max_entries=max_entries,
+        max_bytes=max_bytes,
+    )

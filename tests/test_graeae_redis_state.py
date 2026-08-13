@@ -49,6 +49,27 @@ def test_in_process_response_cache_isolates_stored_and_returned_values():
     }
 
 
+def test_in_process_response_cache_evicts_to_configurable_byte_budget():
+    cache = ResponseCache(max_entries=500, max_bytes=80)
+
+    cache.set("first", "reasoning", {"response_text": "a" * 30})
+    cache.set("second", "reasoning", {"response_text": "b" * 30})
+
+    assert cache.get("first", "reasoning") is None
+    assert cache.get("second", "reasoning") == {"response_text": "b" * 30}
+    assert cache.stats()["bytes"] <= 80
+    assert cache.stats()["max_bytes"] == 80
+
+
+def test_in_process_response_cache_does_not_retain_oversized_entry():
+    cache = ResponseCache(max_bytes=10)
+
+    cache.set("prompt", "reasoning", {"response_text": "too large"})
+
+    assert cache.get("prompt", "reasoning") is None
+    assert cache.stats()["bytes"] == 0
+
+
 @pytest.mark.asyncio
 async def test_redis_response_cache_get_and_set_use_stable_key_shape():
     redis = SimpleNamespace(get=AsyncMock(), set=AsyncMock(), mget=AsyncMock())
