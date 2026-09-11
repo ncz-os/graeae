@@ -812,9 +812,6 @@ class GraeaeEngine:
             close = getattr(resource, "close", None)
             if close is not None:
                 await call_maybe_async(close)
-        from mnemos.api.routes.consultations import close_consult_quota_client
-
-        await close_consult_quota_client()
         global _graeae_engine
         if _graeae_engine is self:
             _graeae_engine = None

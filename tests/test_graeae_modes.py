@@ -404,6 +404,10 @@ async def test_backend_without_capability_attribute_dispatches_webhook(
     class _Backend:
         consultations = consultations_repo
         webhooks = webhooks_repo
+        state_kv = SimpleNamespace(
+            get=AsyncMock(return_value=None),
+            set=AsyncMock(return_value=None),
+        )
 
         @asynccontextmanager
         async def transactional(self):

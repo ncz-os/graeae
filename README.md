@@ -53,7 +53,7 @@ Gateway calls are bounded before GRAEAE dispatches to upstream LLM providers:
 | `MNEMOS_GRAEAE_MAX_OUTPUT_TOKENS` | `8192` | Maximum caller-requested output tokens forwarded to a provider. |
 | `MNEMOS_GRAEAE_MAX_CANDIDATES` | `1` | Maximum caller-requested candidate count (`n`) forwarded to providers that support it. |
 | `MNEMOS_GRAEAE_AUDIT_HMAC_KEY` | no default; required | Secret used to authenticate the consultation audit chain. Generate a high-entropy value and provision it before enabling GRAEAE. Requests fail before provider dispatch when it is absent. |
-| `MNEMOS_GRAEAE_CONSULT_QUOTA_PER_MIN` | `20` | Cost-weighted consultation units allowed per principal each minute. Edge and dev enforce this in process; server deployments require Redis. |
+| `MNEMOS_GRAEAE_CONSULT_QUOTA_PER_MIN` | `20` | Cost-weighted consultation units allowed per principal each minute. Enforced through the active persistence backend's `state_kv` ABC (no Redis dependency); row-locked for safe multi-instance coordination. |
 
 The engine also clips temperature/top-p, penalties, and stop sequences to
 provider-safe ranges before dispatch. Operators can raise the token/candidate
