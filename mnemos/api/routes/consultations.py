@@ -6,21 +6,20 @@
 
 import hashlib
 import hmac
+import json
 
 from mnemos.core import audit_chain
 import logging
 import os
-import threading
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_consultations_backend
-from mnemos.core.config import get_settings
+from mnemos.api.persistence_helpers import backend_or_503, require_consultations_backend
 from mnemos.core.rate_limit import limiter
-from mnemos.core.resilience import _redis_storage_uri
 from mnemos.core.security import is_root, scope_namespace
 from mnemos.domain.graeae.engine import _REGISTRY_MAP
 from mnemos.domain.models import (
@@ -114,6 +113,27 @@ def compute_audit_chain_hash(
 # still fire 60 mode=all / mode=debate consultations per minute, each fanning
 # out to every muse — a financial DoS. Enforce a server-side, per-USER,
 # cost-WEIGHTED sliding-window quota so expensive modes drain budget faster.
+#
+# Storage: a single ``state_kv`` row per principal (a JSON array of recent
+# {ts_ms, weight} entries), kept in a dedicated namespace so quota rows never
+# share keys with other state_kv callers. The persistence backend is the same
+# fleet-shared coordination point the rest of mnemos-core already uses for
+# webhook lease/claim, journal, etc.; no external cache dependency. Every
+# read + prune + write happens inside ONE backend transaction so two
+# concurrent requests for the same principal can't both succeed past the
+# quota.
+#
+# Locking: ``state_kv.get()`` is a plain non-locking SELECT on every
+# backend (postgres / oracle / mysql / mariadb / db2 / sqlite), so the
+# naive read-modify-write is racy. We take a per-principal lock first.
+#   * Postgres  : pg_advisory_xact_lock — proven pattern (review #10 audit
+#                 chain in this same file uses the same keying scheme).
+#   * Oracle/DB2/MySQL/MariaDB: SELECT ... FOR UPDATE on the row via the
+#                 backend's underlying conn. SQLite serializes writers
+#                 via BEGIN IMMEDIATE, so the implicit tx lock is enough.
+#
+# Multiple instances pointing at the same backend are safe by the same
+# reasoning as the audit chain: the backend's row lock is fleet-wide.
 _MODE_COST_WEIGHT = {
     "single": 1.0,
     "local": 1.0,
@@ -124,48 +144,17 @@ _MODE_COST_WEIGHT = {
     "debate": 8.0,
 }
 _QUOTA_WINDOW_SECONDS = 60.0
-_QUOTA_KEY_PREFIX = "mnemos:graeae:consult-quota:"
-_consult_quota_redis = None
-_consult_quota_local: dict[str, list[tuple[float, float]]] = {}
-_consult_quota_local_lock = threading.Lock()
-_CONSULT_QUOTA_GC_INTERVAL = 256
-_CONSULT_QUOTA_MAX_BUCKETS = 4096
-_consult_quota_gc_touches = 0
-
-_CONSULT_QUOTA_LUA = """
-local key = KEYS[1]
-local sequence_key = KEYS[2]
-local weight = tonumber(ARGV[1])
-local quota = tonumber(ARGV[2])
-local window_ms = tonumber(ARGV[3])
-local redis_time = redis.call('TIME')
-local now_ms = (tonumber(redis_time[1]) * 1000) + math.floor(tonumber(redis_time[2]) / 1000)
-local cutoff = now_ms - window_ms
-
-redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
-local used = 0
-local members = redis.call('ZRANGE', key, 0, -1)
-for _, member in ipairs(members) do
-  local separator = string.find(member, ':', 1, true)
-  used = used + tonumber(string.sub(member, 1, separator - 1))
-end
-
-if used + weight > quota then
-  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
-  local retry_ms = window_ms
-  if #oldest == 2 then
-    retry_ms = math.max(1, tonumber(oldest[2]) + window_ms - now_ms)
-  end
-  return {0, tostring(used), retry_ms}
-end
-
-local sequence = redis.call('INCR', sequence_key)
-local member = tostring(weight) .. ':' .. tostring(now_ms) .. ':' .. tostring(sequence)
-redis.call('ZADD', key, now_ms, member)
-redis.call('PEXPIRE', key, window_ms)
-redis.call('PEXPIRE', sequence_key, window_ms)
-return {1, tostring(used + weight), 0}
-"""
+_QUOTA_NAMESPACE = "graeae-consult-quota"
+# A single sentinel "default" owner_id keeps the quota row per-principal
+# (the principal hash IS the key). Cross-tenant isolation is the SHA-256
+# over user_id; see _quota_principal_key below.
+_QUOTA_OWNER_ID = "default"
+# Bound the JSON blob: 256 entries is 256 * 256B-ish events — enough for
+# any plausible per-minute workload without an unbounded row.
+_QUOTA_MAX_ENTRIES = 256
+# Backend class names for which the advisory-lock path is available.
+# Same detection shape as mnemos/webhooks/dispatcher.py:70.
+_POSTGRES_BACKEND_NAME = "PostgresBackend"
 
 
 def _consult_quota_per_min() -> float:
@@ -175,166 +164,223 @@ def _consult_quota_per_min() -> float:
         return 20.0
 
 
-def _get_lifecycle_redis_client():
-    """Return the route-owned Redis client selected by core resilience config.
+def _quota_principal_key(user_id: str) -> str:
+    """Stable per-principal key for the state_kv quota row.
 
-    Core no longer exposes a lifecycle Redis client. Its current Redis
-    resilience backends derive the connection from ``rate_limit.storage_uri``
-    and own their client, so this route follows the same model. The historical
-    function name remains as a narrow compatibility seam for callers that
-    inject a test client.
+    SHA-256 over the raw user_id keeps PII out of the row key and gives a
+    fixed-length identifier; the actual read/append happens against this
+    string only inside the backend.
     """
-    global _consult_quota_redis
-    if _consult_quota_redis is not None:
-        return _consult_quota_redis
-    redis_uri = _redis_storage_uri(get_settings())
-    if not redis_uri:
-        return None
-    try:
-        import redis.asyncio as redis
-    except ImportError:
-        return None
-    _consult_quota_redis = redis.from_url(redis_uri, decode_responses=True)
-    return _consult_quota_redis
+    return hashlib.sha256(str(user_id or "anonymous").encode()).hexdigest()
 
 
-def _single_worker_memory_quota_enabled(settings) -> bool:
-    """Return whether this is an explicitly local, single-worker profile."""
-    profile = str(getattr(getattr(settings, "server", None), "profile", "") or "").lower()
-    if profile == "personal":
-        profile = "edge"
-    workers = int(getattr(getattr(settings, "server", None), "workers", 1) or 1)
-    storage_uri = str(
-        getattr(getattr(settings, "rate_limit", None), "storage_uri", "") or ""
-    ).lower()
-    return profile in {"edge", "dev"} and workers == 1 and storage_uri == "memory://"
+def _advisory_lock_key(principal_key: str) -> int:
+    """Stable signed-int64 Postgres advisory lock key for one principal.
+
+    Same shape as _branch_advisory_lock_key in mnemos/api/routes/dag.py:
+    take the first 8 bytes of the SHA-256 digest of a namespaced string,
+    reinterpret as signed int64 so pg_advisory_xact_lock accepts it.
+    """
+    digest = hashlib.sha256(f"graeae-consult-quota:{principal_key}".encode()).digest()[:8]
+    key = int.from_bytes(digest, "big", signed=False)
+    if key >= 2**63:
+        key -= 2**64
+    return key
 
 
-def _gc_local_consult_quota(*, cutoff: float) -> None:
-    """Drop idle local quota buckets while holding the quota lock."""
-    stale = [
-        principal
-        for principal, entries in _consult_quota_local.items()
-        if not entries or entries[-1][0] <= cutoff
-    ]
-    for principal in stale:
-        _consult_quota_local.pop(principal, None)
+async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
+    """Take a row-level lock on the (owner_id, namespace, key) quota row.
 
+    Backend dispatch — all paths are equivalent to "serialize concurrent
+    read-modify-write on this row inside the open transaction":
 
-def _evict_oldest_local_consult_quota(*, target_size: int) -> None:
-    """Bound local fallback memory by evicting least-recently-used buckets."""
-    if len(_consult_quota_local) <= target_size:
+      * Postgres: pg_advisory_xact_lock(int64) keyed on a stable hash of
+        the principal. Same proven pattern as the audit-chain advisory
+        lock earlier in this file.
+      * Oracle / Db2: ``await conn.cursor()`` then SELECT ... FOR UPDATE
+        on the ``state`` row. python-oracledb's async API returns an
+        ``AsyncCursor`` from ``await conn.cursor()``.
+      * MySQL / MariaDB: ``async with conn.cursor() as cursor`` then
+        SELECT ... FOR UPDATE. aiomysql returns a context-manager cursor
+        from ``conn.cursor()`` directly.
+      * Sqlite: ``BEGIN IMMEDIATE`` already holds a RESERVED write lock
+        on the only writer connection; no extra statement needed.
+
+    Best-effort: any backend where we cannot raise a lock (e.g. an
+    unsupported driver surface) falls back to a bare ``state_kv.get()``
+    via the rest of the function — that path is no worse than the legacy
+    in-memory fallback the old code shipped, but the operator sees a
+    warning log instead of a 5xx.
+    """
+    backend = _lc._persistence_backend
+    backend_name = type(backend).__name__ if backend is not None else ""
+    conn = getattr(tx, "conn", None)
+    if conn is None:
         return
-    oldest_first = sorted(
-        _consult_quota_local.items(),
-        key=lambda item: item[1][-1][0] if item[1] else float("-inf"),
-    )
-    for principal, _entries in oldest_first[: len(_consult_quota_local) - target_size]:
-        _consult_quota_local.pop(principal, None)
 
+    if backend_name == _POSTGRES_BACKEND_NAME:
+        # asyncpg: ``conn.execute`` with a bind parameter, no commit
+        # needed — pg_advisory_xact_lock is tx-scoped. Same template as
+        # the audit-chain advisory lock earlier in this file.
+        await conn.execute("SELECT pg_advisory_xact_lock($1)", _advisory_lock_key(principal_key))
+        return
 
-def _enforce_local_consult_quota(principal: str, weight: float, quota: float) -> None:
-    """Atomically enforce quota for supported single-process deployments."""
-    global _consult_quota_gc_touches
-    now = time.monotonic()
-    cutoff = now - _QUOTA_WINDOW_SECONDS
-    with _consult_quota_local_lock:
-        _consult_quota_gc_touches += 1
-        if _consult_quota_gc_touches >= _CONSULT_QUOTA_GC_INTERVAL:
-            _consult_quota_gc_touches = 0
-            _gc_local_consult_quota(cutoff=cutoff)
-
-        # Enforce the cap before creating a new principal bucket. Run a stale
-        # sweep first even between periodic sweeps, then evict the oldest half
-        # if high-cardinality churn still fills the map.
-        if principal not in _consult_quota_local and len(_consult_quota_local) >= _CONSULT_QUOTA_MAX_BUCKETS:
-            _gc_local_consult_quota(cutoff=cutoff)
-            if len(_consult_quota_local) >= _CONSULT_QUOTA_MAX_BUCKETS:
-                _evict_oldest_local_consult_quota(
-                    target_size=max(0, _CONSULT_QUOTA_MAX_BUCKETS // 2)
-                )
-
-        entries = [entry for entry in _consult_quota_local.get(principal, []) if entry[0] > cutoff]
-        used = sum(entry[1] for entry in entries)
-        if used + weight > quota:
-            retry = max(1, int(entries[0][0] + _QUOTA_WINDOW_SECONDS - now) + 1) if entries else 1
-            _consult_quota_local[principal] = entries
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"GRAEAE consultation quota exceeded for this principal "
-                    f"({used:.0f}+{weight:.0f} > {quota:.0f} cost-units/min)"
-                ),
-                headers={"Retry-After": str(retry)},
+    if backend_name in {"OracleBackend", "Db2Backend", "Db2BackendNative"}:
+        # python-oracledb async API: ``await conn.cursor()`` returns an
+        # AsyncCursor (with __aenter__/__aexit__).
+        cursor = await conn.cursor()
+        try:
+            await cursor.execute(
+                "SELECT key FROM state "
+                "WHERE owner_id = :owner_id AND namespace = :namespace "
+                "AND key = :key AND deleted_at IS NULL FOR UPDATE",
+                {
+                    "owner_id": _QUOTA_OWNER_ID,
+                    "namespace": _QUOTA_NAMESPACE,
+                    "key": principal_key,
+                },
             )
-        entries.append((now, weight))
-        _consult_quota_local[principal] = entries
-
-
-async def close_consult_quota_client() -> None:
-    """Close and clear the route-owned Redis client during lifespan teardown."""
-    global _consult_quota_gc_touches, _consult_quota_redis
-    with _consult_quota_local_lock:
-        _consult_quota_local.clear()
-        _consult_quota_gc_touches = 0
-    client, _consult_quota_redis = _consult_quota_redis, None
-    if client is None:
+            # Drain the cursor so the FOR UPDATE row lock is actually
+            # held by the open transaction (Oracle is non-autocommitting
+            # and won't acquire the lock until the row is read). The
+            # fetch itself can legitimately return nothing if the row
+            # doesn't exist yet — Oracle still locks the gap.
+            try:
+                await cursor.fetchone()
+            except Exception as drain_exc:  # noqa: BLE001
+                logger.debug(
+                    "quota row-lock drain returned no row for principal=%s: %s",
+                    principal_key[:12],
+                    drain_exc,
+                )
+        finally:
+            await cursor.close()
         return
-    close = getattr(client, "aclose", None) or getattr(client, "close", None)
-    if close is not None:
-        result = close()
-        if hasattr(result, "__await__"):
-            await result
+
+    if backend_name in {"MysqlBackend", "MariadbBackend"}:
+        # aiomysql: ``conn.cursor()`` returns an async context manager
+        # directly (no await).
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT key FROM state "
+                "WHERE owner_id = %s AND namespace = %s AND key = %s "
+                "AND deleted_at IS NULL FOR UPDATE",
+                (_QUOTA_OWNER_ID, _QUOTA_NAMESPACE, principal_key),
+            )
+            await cursor.fetchone()
+        return
+
+    # Sqlite + any other backend: BEGIN IMMEDIATE / transaction-level
+    # serialization is already in effect. No extra statement needed.
+
+
+def _prune_quota_entries(entries: list[dict[str, Any]], *, now_ms: int) -> list[dict[str, Any]]:
+    """Drop entries older than the sliding window and bound total size."""
+    cutoff = now_ms - int(_QUOTA_WINDOW_SECONDS * 1000)
+    pruned = [entry for entry in entries if int(entry.get("ts_ms", 0)) > cutoff]
+    if len(pruned) > _QUOTA_MAX_ENTRIES:
+        # Keep the most recent MAX_ENTRIES — older ones are either in the
+        # window (and thus already counted) or stale. We can't have
+        # overflowed past MAX_ENTRIES legitimately inside one minute
+        # without already being throttled, so this is a defensive trim.
+        pruned = pruned[-_QUOTA_MAX_ENTRIES:]
+    return pruned
 
 
 async def _enforce_consult_quota(user_id: str, mode: str) -> None:
-    """Atomically enforce the shared, cost-weighted per-principal quota."""
+    """Atomically enforce the shared, cost-weighted per-principal quota.
+
+    The whole read-prune-write happens inside one ``backend.transactional()``
+    block so the row lock taken by ``_lock_quota_row_for_update`` actually
+    spans the read-modify-write window. Two concurrent requests for the
+    same principal queue at the row lock; the second sees the first's
+    appended entry and is rejected if it pushes the principal over quota.
+    """
     quota = _consult_quota_per_min()
     if quota <= 0:
         return
+
     weight = _MODE_COST_WEIGHT.get((mode or "auto").lower(), 2.0)
-    settings = get_settings()
-    principal = hashlib.sha256(str(user_id or "anonymous").encode()).hexdigest()
-    redis = _get_lifecycle_redis_client()
-    if redis is None:
-        if _single_worker_memory_quota_enabled(settings):
-            _enforce_local_consult_quota(principal, weight, quota)
-            return
+    principal_key = _quota_principal_key(user_id)
+
+    backend = backend_or_503()
+    state_kv = getattr(backend, "state_kv", None)
+    if state_kv is None:
+        # Backend doesn't implement the StateRepository ABC. We have no
+        # shared storage path — fail closed with the same shape the prior
+        # external-cache path used.
         raise HTTPException(
             status_code=503,
             detail="Shared consultation quota storage is unavailable.",
         )
 
-    key = f"{_QUOTA_KEY_PREFIX}{principal}"
+    now_ms = int(time.time() * 1000)
+
     try:
-        allowed, used_raw, retry_ms = await redis.eval(
-            _CONSULT_QUOTA_LUA,
-            2,
-            key,
-            f"{key}:sequence",
-            weight,
-            quota,
-            int(_QUOTA_WINDOW_SECONDS * 1000),
-        )
-    except Exception as exc:
-        logger.error("[CONSULTATION] shared quota check failed: %s", exc)
+        async with backend.transactional() as tx:
+            await _lock_quota_row_for_update(tx, principal_key)
+            existing = await state_kv.get(
+                tx,
+                principal_key,
+                owner_id=_QUOTA_OWNER_ID,
+                namespace=_QUOTA_NAMESPACE,
+            )
+            try:
+                raw_value = existing["value"] if existing else None
+                entries = json.loads(raw_value) if raw_value else []
+                if not isinstance(entries, list):
+                    entries = []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                entries = []
+
+            entries = _prune_quota_entries(entries, now_ms=now_ms)
+            used = sum(float(entry.get("weight", 0.0)) for entry in entries)
+
+            if used + weight > quota:
+                # 429 with Retry-After. Match the prior external-cache path's
+                # response shape exactly so existing clients see the same
+                # contract.
+                if entries:
+                    oldest_ts_ms = int(entries[0].get("ts_ms", now_ms))
+                    retry = max(
+                        1,
+                        ((oldest_ts_ms + int(_QUOTA_WINDOW_SECONDS * 1000) - now_ms) + 999) // 1000,
+                    )
+                else:
+                    retry = 1
+                # Persist the pruned list so we don't leak stale entries
+                # that survived the cutoff but were rejected this turn.
+                await state_kv.set(
+                    tx,
+                    principal_key,
+                    json.dumps(entries, separators=(",", ":")),
+                    owner_id=_QUOTA_OWNER_ID,
+                    namespace=_QUOTA_NAMESPACE,
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        f"GRAEAE consultation quota exceeded for this principal "
+                        f"({used:.0f}+{weight:.0f} > {quota:.0f} cost-units/min)"
+                    ),
+                    headers={"Retry-After": str(retry)},
+                )
+
+            entries.append({"ts_ms": now_ms, "weight": weight})
+            await state_kv.set(
+                tx,
+                principal_key,
+                json.dumps(entries, separators=(",", ":")),
+                owner_id=_QUOTA_OWNER_ID,
+                namespace=_QUOTA_NAMESPACE,
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("[CONSULTATION] shared quota check failed")
         raise HTTPException(
             status_code=503,
             detail="Shared consultation quota storage is unavailable.",
-        ) from exc
-
-    if not int(allowed):
-        if isinstance(used_raw, bytes):
-            used_raw = used_raw.decode()
-        used = float(used_raw)
-        retry = max(1, (int(retry_ms) + 999) // 1000)
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"GRAEAE consultation quota exceeded for this principal "
-                f"({used:.0f}+{weight:.0f} > {quota:.0f} cost-units/min)"
-            ),
-            headers={"Retry-After": str(retry)},
         )
 
 
