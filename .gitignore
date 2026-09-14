@@ -16,3 +16,13 @@ htmlcov/
 # Virtualenvs
 .venv/
 venv/
+
+# uv auto-generated lockfile + zoder review scratch files. The lockfile
+# is not part of the published distribution; it's regenerated on demand
+# by `uv lock` (and only used locally to keep `uv run` happy when the
+# sibling mnemos-core checkout is at ../mnemos-core). zoder_run.log is
+# the review harness's append-only scratch log and contains no project
+# data — committing it would only add noise to future diffs.
+uv.lock
+zoder_run.log
+.zoder_task_*.md

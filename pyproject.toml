@@ -26,3 +26,19 @@ namespaces = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+
+[tool.uv.sources]
+# mnemos-core is a sibling monorepo distribution, not on the public
+# package registry. The canonical CI workflow (`gitlab-ci.yml`)
+# checks it out next to this repo and installs both editably:
+#
+#   git clone https://gitlab.com/ncz-os/mnemos.git ../mnemos-core
+#   python -m pip install -e ../mnemos-core -e ".[test]"
+#
+# Mirror that for `uv run`: when uv is doing dependency resolution
+# from this checkout (e.g. `uv run pytest`), redirect the mnemos-core
+# requirement at the canonical sibling path. Operators / CI runners
+# without that sibling get a clean "mnemos-core not found" rather
+# than a silent registry fetch — uv does NOT fall back to the public
+# index for a `path` source.
+mnemos-core = { path = "../mnemos-core", editable = true }

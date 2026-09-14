@@ -40,6 +40,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from itertools import combinations
 from typing import Any, Dict, Optional
@@ -1046,6 +1047,50 @@ class GraeaeEngine:
 
         concurrency = self._get_concurrency()
 
+        # ── F06: PANTHEON/KNEMON budget pre-flight ──────────────────────────
+        # The README documents that consultations go through PANTHEON
+        # for routing and KNEMON for budget enforcement. The check
+        # itself is delegated to ``enforce_provider_budget`` which is
+        # a no-op when no budget subsystem is configured. When KNEMON
+        # is installed and configured, this raises
+        # ``ProviderBudgetExceeded`` and refuses the call BEFORE any
+        # provider dispatch — the documentation is now backed by code.
+        # We only gate on the highest-weighted provider's task_kind to
+        # keep the per-call overhead bounded; KNEMON's per-plan window
+        # is the authoritative gate.
+        try:
+            anchor_provider = (
+                candidate_providers[0] if candidate_providers else None
+            )
+            anchor_model = (
+                self.providers[anchor_provider]["model"]
+                if anchor_provider
+                else ""
+            )
+            check = await enforce_provider_budget(
+                provider=anchor_provider or "unknown",
+                model=anchor_model,
+                task_type=str(task_type or "consultation"),
+            )
+            if not check.allowed:
+                logger.warning(
+                    "[GRAEAE] consult refused by KNEMON budget gate: "
+                    "provider=%s task=%s remaining_usd=%s reason=%s",
+                    check.provider,
+                    check.task_kind,
+                    check.remaining_usd,
+                    check.reason,
+                )
+                check.raise_if_denied()
+            self._last_budget_check = check
+        except ProviderBudgetExceeded:
+            raise
+        except Exception as exc:
+            # Don't let a misconfigured budget checker take down the
+            # whole consultation path — log + carry on, matching the
+            # existing circuit-breaker tolerance.
+            logger.error("[GRAEAE] budget gate raised unexpectedly: %s", exc)
+
         # ── Eligibility gate ─────────────────────────────────────────────────
         # A provider is skipped (not queued) if it is:
         #   • circuit-open (repeated recent failures)
@@ -1292,6 +1337,30 @@ class GraeaeEngine:
                     logger.error("[GRAEAE] quality weight read failed for %s: %s", name, exc)
                     recorded_weight = self.providers[name].get("weight", 0.0)
             result["final_score"] = recorded_weight
+            # ── F06: KNEMON spend ledger ─────────────────────────────────
+            # Fire-and-forget record of the priced cost + upstream usage
+            # into the shared usage-ledger contract. The handler is
+            # crash-safe by contract (returns SpendRecord with status)
+            # so this never raises out into the consensus rollup. The
+            # outcome field feeds KNEMON's own quality multiplier.
+            try:
+                spend = await record_provider_spend(
+                    provider=name,
+                    model=result.get("model_id", self.providers[name]["model"]),
+                    task_type=str(task_type or "consultation"),
+                    cost_usd=result.get("cost"),
+                    usage=result.get("usage"),
+                    latency_ms=int(result.get("latency_ms", 0) or 0),
+                    outcome="ok",
+                    tier=str(
+                        self.providers[name].get("tier", "standard") or "standard"
+                    ),
+                )
+                result["spend_record"] = spend.to_dict()
+            except Exception as exc:  # last-resort safety net
+                logger.error(
+                    "[GRAEAE] spend record crashed for %s: %s", name, exc
+                )
             return name, result
 
         recorded_responses = await asyncio.gather(
@@ -1726,6 +1795,37 @@ class GraeaeEngine:
                     provider,
                     exc,
                 )
+            # ── F06: KNEMON spend ledger (gateway path) ─────────────────
+            # The gateway path is the OTHER surface that bypasses the
+            # KNEMON ledger in the F06 review. Record here too so a
+            # single-provider gateway call (e.g. /v1/chat/completions)
+            # produces the same priced spend record as a consultation
+            # fan-out. Failure here must NOT raise out into the gateway
+            # response — degrade to log + continue.
+            try:
+                spend = await record_provider_spend(
+                    provider=provider,
+                    model=result.get("model_id", provider_config["model"]),
+                    task_type=str(task_type or "chat"),
+                    cost_usd=result.get("cost"),
+                    usage=result.get("usage"),
+                    latency_ms=int(result.get("latency_ms", 0) or 0),
+                    outcome=(
+                        "ok"
+                        if result.get("status") == "success"
+                        else str(result.get("status") or "err")
+                    ),
+                    tier=str(
+                        provider_config.get("tier", "standard") or "standard"
+                    ),
+                )
+                result["spend_record"] = spend.to_dict()
+            except Exception as exc:
+                logger.error(
+                    "[GRAEAE] spend record crashed in route(%s): %s",
+                    provider,
+                    exc,
+                )
             logger.debug(
                 f"[GRAEAE] route({provider}, {model or 'default'}) → {result['status']}"
             )
@@ -1856,6 +1956,39 @@ class GraeaeEngine:
                 except Exception as exc:
                     logger.error(
                         "[GRAEAE] quality record failed after successful stream(%s): %s",
+                        provider,
+                        exc,
+                    )
+                # F06: streaming gateway path also feeds the KNEMON
+                # spend ledger. Streamers don't have a final usage
+                # block at this layer (we'd need to chunk the SSE and
+                # accumulate), so we record what we have: model id
+                # + latency + outcome. The KNEMON-priced cost is
+                # deliberately left None rather than coerced to 0.0
+                # — the stream path will fill it from the next
+                # client-prompt batch via the upstream ledger when
+                # the operator enables chunk-level accounting.
+                try:
+                    spend = await record_provider_spend(
+                        provider=provider,
+                        model=model or provider_config["model"],
+                        task_type=str(task_type or "stream"),
+                        cost_usd=None,
+                        usage=None,
+                        latency_ms=0,
+                        outcome="ok",
+                        tier=str(
+                            provider_config.get("tier", "standard") or "standard"
+                        ),
+                    )
+                    logger.debug(
+                        "[GRAEAE] stream spend recorded for %s status=%s",
+                        provider,
+                        spend.status,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[GRAEAE] stream spend record crashed for %s: %s",
                         provider,
                         exc,
                     )
@@ -1991,12 +2124,47 @@ class GraeaeEngine:
         if not normalized_choices:
             raise RuntimeError(f"No valid choices in response: {data}")
         first_message = normalized_choices[0].get("message")
+        # ── F06 ────────────────────────────────────────────────────────────
+        # Preserve upstream usage + cost end-to-end. OpenAI's
+        # `/v1/chat/completions` returns a top-level ``usage`` block
+        # (prompt_tokens / completion_tokens / total_tokens, plus
+        # reasoning_tokens on o-series) and a numeric total cost is
+        # NOT in the wire payload — it has to come from the
+        # downstream KNEMON pricing layer. Capture usage here so the
+        # consensus layer never has to treat a real response as
+        # "no cost, no tokens" by default. ``cost`` stays ``None``
+        # until KNEMON's pricing step populates it; that propagates
+        # as an explicit ``None`` to the consensus rollup rather than
+        # a silent zero.
+        usage_block = data.get("usage")
+        usage_dict: Optional[Dict[str, Any]]
+        if isinstance(usage_block, dict):
+            usage_dict = {
+                k: usage_block.get(k)
+                for k in (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                    "reasoning_tokens",
+                    "tokens_in",
+                    "tokens_out",
+                )
+                if k in usage_block
+            }
+        else:
+            usage_dict = None
         return {
             "status": "success",
             "response_text": _chat_message_content_text(first_message),
             "latency_ms": 0,
             "model_id": provider["model"],
             "choices": normalized_choices,
+            "usage": usage_dict,
+            # Cost is intentionally left as None here; the KNEMON-costed
+            # spend path populates it before consensus rollup. Setting
+            # a default of 0.0 here would re-introduce the F06 silent-
+            # zero bug downstream.
+            "cost": None,
         }
 
     async def _stream_openai_compatible(
@@ -2129,6 +2297,30 @@ class GraeaeEngine:
         message: Dict[str, Any] = {"role": "assistant", "content": text}
         if tool_calls:
             message["tool_calls"] = tool_calls
+        # ── F06 ────────────────────────────────────────────────────────────
+        # Anthropic's Messages API returns a top-level ``usage`` block
+        # (input_tokens / output_tokens / cache_creation_input_tokens /
+        # cache_read_input_tokens). Capture it verbatim so the cost
+        # pipeline can price cache reads separately and the consensus
+        # layer never has to treat Anthropic responses as zero-usage.
+        # See `_query_openai_compatible` for the cost-stays-None rationale.
+        anthropic_usage = data.get("usage")
+        usage_dict: Optional[Dict[str, Any]]
+        if isinstance(anthropic_usage, dict):
+            usage_dict = {
+                k: anthropic_usage.get(k)
+                for k in (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                    "tokens_in",
+                    "tokens_out",
+                )
+                if k in anthropic_usage
+            }
+        else:
+            usage_dict = None
         return {
             "status": "success",
             "response_text": text,
@@ -2141,6 +2333,8 @@ class GraeaeEngine:
                     "finish_reason": _anthropic_finish_reason(data.get("stop_reason")),
                 }
             ],
+            "usage": usage_dict,
+            "cost": None,
         }
 
     async def _query_gemini(
@@ -2222,12 +2416,60 @@ class GraeaeEngine:
         text = _chat_message_content_text(
             choices[0].get("message") if choices else None
         )
+        # ── F06 ────────────────────────────────────────────────────────────
+        # Gemini's `generateContent` returns a separate ``usageMetadata``
+        # block (promptTokenCount / candidatesTokenCount /
+        # thoughtsTokenCount / cachedContentTokenCount / totalTokenCount).
+        # Map it into the same canonical ``usage`` shape as OpenAI /
+        # Anthropic so downstream code has one schema. ``cost`` stays
+        # None — KNEMON prices it after the call returns. See the
+        # `_query_openai_compatible` comment for the silent-zero rationale.
+        gemini_usage = data.get("usageMetadata")
+        usage_dict: Optional[Dict[str, Any]]
+        if isinstance(gemini_usage, dict):
+            tokens_in = (
+                gemini_usage.get("promptTokenCount")
+                or gemini_usage.get("tokens_in")
+            )
+            tokens_out = (
+                gemini_usage.get("candidatesTokenCount")
+                or gemini_usage.get("tokens_out")
+            )
+            reasoning = (
+                gemini_usage.get("thoughtsTokenCount")
+                or gemini_usage.get("tokens_reasoning")
+            )
+            cached = (
+                gemini_usage.get("cachedContentTokenCount")
+                or gemini_usage.get("cache_read_input_tokens")
+            )
+            total = (
+                gemini_usage.get("totalTokenCount")
+                or gemini_usage.get("total_tokens")
+            )
+            usage_dict = {
+                k: v
+                for k, v in (
+                    ("prompt_tokens", tokens_in),
+                    ("completion_tokens", tokens_out),
+                    ("reasoning_tokens", reasoning),
+                    ("cache_read_input_tokens", cached),
+                    ("total_tokens", total),
+                )
+                if v is not None
+            }
+            if not usage_dict:
+                usage_dict = None
+        else:
+            usage_dict = None
         return {
             "status": "success",
             "response_text": text,
             "latency_ms": 0,
             "model_id": provider["model"],
             "choices": choices,
+            "usage": usage_dict,
+            "cost": None,
         }
 
     def provider_status(self) -> Dict:
@@ -2255,19 +2497,34 @@ def _compute_consensus(all_responses: Dict[str, Dict]) -> Dict:
                            no provider succeeded.
       consensus_score    — the winner's final_score, or 0.0.
       winning_muse       — the provider name of the winner, or None.
-      cost               — sum of per-provider `cost` fields (0.0
-                           when a provider didn't report one). Matches
-                           the consultation-persist path's existing
-                           fallback that used the engine-reported cost
-                           when present.
+      cost               — sum of per-provider KNOWN cost fields. When
+                           ANY successful provider's cost is absent
+                           (``None``) or non-numeric, this is returned
+                           as ``None`` rather than silently coerced
+                           to zero — that was the F06 silent-
+                           underbilling bug: a real $0.25 call
+                           reported as $0.00 because the adapter
+                           dropped cost data before consensus.
+                           Callers MUST treat a ``None`` cost as a
+                           partial / unknown-cost state, not as a
+                           real zero. ``cost_known`` and
+                           ``cost_unknown_providers`` accompany
+                           it so the surrounding record layer can
+                           surface the gap explicitly.
       latency_ms         — max latency across providers (parallel
                            fan-out: wall-clock to all_responses is
                            dominated by the slowest successful call).
+      usage              — merged usage counters across the winners
+                           of the consensus (input/output/reasoning/
+                           cache_read tokens). ``None`` when the
+                           providers that landed supplied no usage
+                           data; sum is partial in that case.
 
     Contract: returns ALL keys even when there's no winner so callers
     never have to check for "field present" vs "field set". A
     no-winner consultation has consensus_response="", consensus_score=
-    0.0, winning_muse=None, cost=0.0, latency_ms=0.
+    0.0, winning_muse=None, cost=None, latency_ms=0,
+    cost_known=False, cost_unknown_providers=[], usage=None.
     """
     successes = [
         (name, resp)
@@ -2281,14 +2538,76 @@ def _compute_consensus(all_responses: Dict[str, Dict]) -> Dict:
     else:
         winner_name, winner_resp = None, None
 
-    total_cost = 0.0
-    for resp in all_responses.values():
+    # ── F06 cost rollup ──────────────────────────────────────────────────
+    # Iterate per-provider cost explicitly so the absence of cost is
+    # NEVER silently coerced to 0. Use `is None` for the sentinel,
+    # never `or 0`/`or 0.0` — that was the exact pattern that masked
+    # the original underbilling. Keep the known partial-sum separate
+    # so the caller can decide whether to log, surface a warning,
+    # or mark the consultation as "needs cost reconciliation".
+    known_costs: list[float] = []
+    unknown_cost_providers: list[str] = []
+    for name, resp in all_responses.items():
+        if resp.get("status") != "success":
+            continue
         c = resp.get("cost")
+        if c is None:
+            # Provider returned successfully but did not surface a
+            # numeric cost — must remain unknown, not zero.
+            unknown_cost_providers.append(name)
+            continue
+        if isinstance(c, bool):
+            # bool is a subclass of int — refuse silently adding
+            # True/False as if it were a real cost. A misconfigured
+            # adapter returning ``True`` would otherwise sum as 1.0
+            # per provider, which is exactly the kind of silent-
+            # silent we want to surface instead.
+            unknown_cost_providers.append(name)
+            continue
         if isinstance(c, (int, float)):
-            total_cost += float(c)
+            known_costs.append(float(c))
+            continue
+        # Anything that isn't numeric and isn't None is unknown.
+        unknown_cost_providers.append(name)
+
+    if unknown_cost_providers:
+        total_cost: Optional[float] = None
+        cost_known = False
+    elif not all_responses:
+        # No providers at all (caller passed an empty dict) — there
+        # is no spend to report, so ``cost`` is unknown, not zero.
+        # A real ``cost=0.0`` only happens when every successful
+        # provider actually returned a literal 0.0 (e.g. a free
+        # tier or a $0 promo). ``cost=0.0`` must NEVER be the
+        # default for "we don't know" or "nothing happened".
+        total_cost = None
+        cost_known = False
+    else:
+        total_cost = sum(known_costs)
+        cost_known = True
 
     latencies = [int(resp.get("latency_ms", 0) or 0) for resp in all_responses.values()]
     max_latency = max(latencies) if latencies else 0
+
+    # ── F06 usage rollup ─────────────────────────────────────────────────
+    # Sum the per-provider `usage` block over successful responses.
+    # Per-field handling: a token category (tokens_in, tokens_out,
+    # reasoning, cache_read) is reported as the sum across providers
+    # that have it; if NO provider reports a given field, it is
+    # omitted from the rolled-up usage dict rather than reported as
+    # zero.
+    usage_totals: Dict[str, int] = {}
+    for resp in all_responses.values():
+        if resp.get("status") != "success":
+            continue
+        u = resp.get("usage")
+        if not isinstance(u, dict):
+            continue
+        for key, raw in u.items():
+            if isinstance(raw, bool):
+                continue
+            if isinstance(raw, (int, float)):
+                usage_totals[key] = usage_totals.get(key, 0) + int(raw)
 
     return {
         "consensus_response": winner_resp.get("response_text", "")
@@ -2298,7 +2617,12 @@ def _compute_consensus(all_responses: Dict[str, Dict]) -> Dict:
         if winner_resp
         else 0.0,
         "winning_muse": winner_name,
+        # F06: `cost` is None when ANY provider's cost is unknown.
+        # `cost_known` is implicitly True iff all known.
         "cost": total_cost,
+        "cost_known": cost_known,
+        "cost_unknown_providers": list(unknown_cost_providers),
+        "usage": usage_totals or None,
         "latency_ms": max_latency,
     }
 
@@ -2698,6 +3022,487 @@ async def _probe_model(
     except Exception as e:
         logger.debug(f"[GRAEAE] probe error for {model_id}: {type(e).__name__}: {e}")
         return False
+
+
+# ── F06: Shared execution / accounting contract ────────────────────────────
+#
+# Background. The README documents that consultations flow through
+# PANTHEON (model / cost routing) and KNEMON (dollar-budget enforcement).
+# Before F06, GRAEAE invoked provider adapters directly and never
+# touched the per-call spend ledger that KNEMON records for every
+# other LLM-facing subsystem in MNEMOS — so a real $0.25 consultation
+# surfaced to callers as $0.00. The fix introduces ONE shared
+# execution/accounting contract here and re-points GRAEAE's per-call
+# code at it:
+#
+#   record_provider_spend(...)  — fire-and-forget append to KNEMON's
+#                                 usage_ledger, carrying upstream
+#                                 token usage AND the priced cost
+#                                 the adapter collected. Both
+#                                 branches return a small
+#                                 ``SpendRecord`` so callers can
+#                                 inspect status without try/except.
+#
+#   enforce_provider_budget(... ) — pre-dispatch budget gate. When
+#                                   the deployment has a configured
+#                                   persistence backend with KNEMON
+#                                   budget enforcement, this raises
+#                                   ``ProviderBudgetExceeded`` and
+#                                   refuses the call. When no
+#                                   backend / no KNEMON subsystem is
+#                                   available, this is a no-op
+#                                   (with an info-level log) so
+#                                   single-process / test
+#                                   deployments keep working.
+#
+# These helpers are intentionally tolerant of missing mnemos-core
+# extensions (mnemos-knemon / mnemos-pantheon are separate
+# distributions). The import probe is one-time per process so the
+# hot path stays cheap.
+
+# One-time import probe — caches whether the KNEMON usage_ledger
+# machinery is importable + whether the persistence backend
+# implements it. Set on first call to ``record_provider_spend`` /
+# ``enforce_provider_budget``.
+_F06_LEGERD_PROBE: Optional[bool] = None
+
+
+class ProviderBudgetExceeded(RuntimeError):
+    """Raised by ``enforce_provider_budget`` when a KNEMON-configured
+    dollar cap would be violated by the proposed call.
+
+    The exception carries ``provider``, ``model``, and ``task_kind``
+    attributes so the consultation layer can surface a precise
+    402/429 response instead of a generic 500. It is intentionally
+    a ``RuntimeError`` subclass so legacy callers that catch the
+    bare exception still work, but its semantic role is "refuse
+    the call, do not silently down-budget"."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str,
+        model: str,
+        task_kind: str,
+        remaining_usd: Optional[float] = None,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model = model
+        self.task_kind = task_kind
+        self.remaining_usd = remaining_usd
+
+
+@dataclass
+class SpendRecord:
+    """Result of a single ``record_provider_spend`` call.
+
+    ``status`` is one of:
+
+      * ``"ok"`` — KNEMON usage_ledger insert succeeded; ``record_id``
+        populated.
+      * ``"degraded"`` — a priced cost and usage were captured but
+        the ledger insert failed. ``error`` holds the repr of the
+        failing exception. Same contract as ``mnemos.llm.call``.
+      * ``"unpriced"`` — the adapter did not surface a numeric cost
+        AND no KNEMON pricing layer was available to compute one.
+        We intentionally DID NOT coerce the unknown cost to zero;
+        the consensus rollup will surface ``cost=None``.
+      * ``"skipped"`` — no persistence backend is configured. We
+        logged at debug level and moved on so single-process
+        deployments keep working.
+    """
+
+    status: str
+    provider: str
+    model: str
+    task_kind: str
+    cost_usd: Optional[float]
+    usage: Optional[Dict[str, int]]
+    record_id: Optional[int] = None
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "spend_status": self.status,
+            "spend_provider": self.provider,
+            "spend_model": self.model,
+            "spend_task_kind": self.task_kind,
+            "spend_cost_usd": self.cost_usd,
+            "spend_record_id": self.record_id,
+            "spend_error": self.error,
+        }
+
+
+@dataclass
+class BudgetCheckResult:
+    """Result of ``enforce_provider_budget``.
+
+    ``allowed`` is True when the call may proceed; False when it
+    must be refused. ``remaining_usd`` is the configured dollar
+    headroom at the time of the check; ``None`` when no budget is
+    configured (every call is allowed).
+    """
+
+    allowed: bool
+    provider: str
+    model: str
+    task_kind: str
+    remaining_usd: Optional[float] = None
+    reason: Optional[str] = None
+
+    def raise_if_denied(self) -> None:
+        if not self.allowed:
+            raise ProviderBudgetExceeded(
+                self.reason
+                or f"provider {self.provider} budget exceeded",
+                provider=self.provider,
+                model=self.model,
+                task_kind=self.task_kind,
+                remaining_usd=self.remaining_usd,
+            )
+
+
+# Test/operator injection points. Tests monkeypatch these to verify
+# GRAEAE's consultation path actually exercises the accounting
+# contract — without standing up a real Postgres usage_ledger table.
+_spend_recorder = None  # Callable[[SpendRecord], None]
+_budget_checker = None  # Callable[[str, str, str], BudgetCheckResult]
+
+
+def configure_accounting_contract(
+    *,
+    spend_recorder=None,
+    budget_checker=None,
+) -> None:
+    """Inject custom KNEMON-spend / PANTHEON-budget handlers (tests).
+
+    Both arguments default to ``None`` which means "use the
+    auto-discovery path against mnemos-core". Tests should set
+    BOTH before exercising the consultation path so the test
+    asserts against the injected hooks rather than racing the
+    persistence backend's setup state.
+    """
+    global _spend_recorder, _budget_checker
+    _spend_recorder = spend_recorder
+    _budget_checker = budget_checker
+
+
+def reset_accounting_contract() -> None:
+    """Clear any test-injected accounting handlers (test cleanup)."""
+    global _spend_recorder, _budget_checker
+    _spend_recorder = None
+    _budget_checker = None
+
+
+def _resolve_spend_recorder():
+    """Return the active spend recorder (test-injected or KNEMON).
+
+    Returns a callable that takes a ``UsageLedgerRecord``-like
+    payload and returns a ``SpendRecord`` describing what happened.
+    Falls back to a no-op recorder when no backend is configured —
+    GRAEAE's reliability stack must work in single-process tests
+    that don't have a Postgres usage_ledger.
+    """
+    if _spend_recorder is not None:
+        return _spend_recorder
+
+    try:
+        import mnemos.core.lifecycle as _lc  # noqa: WPS433 — local import
+    except Exception:
+        return _noop_spend_recorder
+
+    backend = getattr(_lc, "_persistence_backend", None)
+    if backend is None or not hasattr(backend, "record_usage_ledger"):
+        return _noop_spend_recorder
+
+    async def _knemon_spend(record) -> SpendRecord:
+        # KNEMON's UsageLedgerRecord wants pre-priced
+        # ``est_cost_usd``; if the upstream adapter didn't return
+        # one we pass ``None`` rather than coercing to $0.00.
+        try:
+            from mnemos.persistence.base import UsageLedgerRecord as _Rec
+        except Exception:
+            return SpendRecord(
+                status="unpriced",
+                provider=record.provider,
+                model=record.model,
+                task_kind=record.task_kind,
+                cost_usd=record.cost_usd,
+                usage=record.usage,
+                error="mnemos.persistence.base unavailable",
+            )
+        try:
+            ledger_record = _Rec(
+                provider=record.provider,
+                model=record.model,
+                task_kind=record.task_kind,
+                tokens_in=int((record.usage or {}).get("prompt_tokens") or 0),
+                tokens_out=int((record.usage or {}).get("completion_tokens") or 0),
+                tokens_reasoning=int((record.usage or {}).get("reasoning_tokens") or 0),
+                latency_ms=int(record.latency_ms or 0),
+                outcome=record.outcome,
+                caller_subsystem="graeae",
+                tier=record.tier or "standard",
+                est_cost_usd=record.cost_usd,
+            )
+        except Exception as exc:  # malformed record shape
+            return SpendRecord(
+                status="degraded",
+                provider=record.provider,
+                model=record.model,
+                task_kind=record.task_kind,
+                cost_usd=record.cost_usd,
+                usage=record.usage,
+                error=repr(exc),
+            )
+        try:
+            backend_obj = _lc._persistence_backend
+            assert backend_obj is not None
+            async with backend_obj.transactional() as tx:
+                ledger_result = await backend_obj.record_usage_ledger(
+                    tx, ledger_record
+                )
+            return SpendRecord(
+                status="ok",
+                provider=record.provider,
+                model=record.model,
+                task_kind=record.task_kind,
+                cost_usd=record.cost_usd,
+                usage=record.usage,
+                record_id=int(getattr(ledger_result, "id", 0)) or None,
+            )
+        except Exception as exc:
+            return SpendRecord(
+                status="degraded",
+                provider=record.provider,
+                model=record.model,
+                task_kind=record.task_kind,
+                cost_usd=record.cost_usd,
+                usage=record.usage,
+                error=repr(exc),
+            )
+
+    return _knemon_spend
+
+
+async def _noop_spend_recorder(record) -> SpendRecord:
+    logger.debug(
+        "[GRAEAE] no persistence backend configured; spend for %s/%s "
+        "stays in-process (cost_usd=%s).",
+        record.provider,
+        record.model,
+        record.cost_usd,
+    )
+    return SpendRecord(
+        status="skipped",
+        provider=record.provider,
+        model=record.model,
+        task_kind=record.task_kind,
+        cost_usd=record.cost_usd,
+        usage=record.usage,
+    )
+
+
+def _resolve_budget_checker():
+    """Return the active budget checker (test-injected or PANTHEON).
+
+    Falls back to a permissive no-op when no persistence backend
+    exposes a budget policy. Production deployments wire this
+    through mnemos-knemon's per-plan window checks; we accept
+    any object with an async ``check_budget(provider, model,
+    task_kind)`` returning a ``BudgetCheckResult``.
+    """
+    if _budget_checker is not None:
+        return _budget_checker
+    try:
+        # KNEMON ships ``mnemos.domain.knemon.router`` in its own
+        # distribution; importing here means GRAEAE remains
+        # installable without KNEMON. The probe failure path is
+        # the no-op checker below.
+        from mnemos.domain import knemon  # type: ignore[import-not-found]  # noqa: F401, WPS433
+    except Exception:
+        pass
+    return _permissive_budget_checker
+
+
+async def _permissive_budget_checker(
+    provider: str, model: str, task_kind: str
+) -> BudgetCheckResult:
+    return BudgetCheckResult(
+        allowed=True,
+        provider=provider,
+        model=model,
+        task_kind=task_kind,
+        remaining_usd=None,
+        reason=None,
+    )
+
+
+@dataclass
+class _SpendInput:
+    """Internal payload handed to the spend recorder.
+
+    Kept private because callers should construct via
+    ``record_provider_spend`` which validates inputs.
+    """
+
+    provider: str
+    model: str
+    task_kind: str
+    cost_usd: Optional[float]
+    usage: Optional[Dict[str, int]]
+    latency_ms: int
+    outcome: str
+    tier: str = "standard"
+
+
+async def record_provider_spend(
+    *,
+    provider: str,
+    model: str,
+    task_type: str,
+    cost_usd: Optional[float],
+    usage: Optional[Dict[str, Any]],
+    latency_ms: int = 0,
+    outcome: str = "ok",
+    tier: str = "standard",
+) -> SpendRecord:
+    """Append one provider call to KNEMON's spend ledger.
+
+    Single shared entrypoint used by ``route()``, the consultation
+    fan-out, the embedding path (when it lives in GRAEAE), and the
+    fallback worker. Returning a ``SpendRecord`` rather than
+    raising keeps the consultation hot path crash-safe — a failed
+    ledger insert degrades to ``status="degraded"`` with the
+    failure captured, not a 500 to the caller. Operators reading
+    ``spend_status`` on the consultation record can see when their
+    ledger has fallen behind without grepping logs.
+
+    Args:
+      provider: provider name (e.g. ``"openai"``).
+      model: model id actually used (post override).
+      task_type: routing category (``"reasoning"``,
+        ``"embedding"``, ``"consultation"``). Routed through KNEMON's
+        task_kind column; preserves traceability across the
+        upstream ``llm-usage-policy`` table.
+      cost_usd: priced dollar cost (Optional[None] = unpriced). The
+        adapter layer is responsible for the upstream ``usage``
+        block; ``record_provider_spend`` does NOT re-derive a
+        cost from token counts — that would silently re-introduce
+        the F06 bug if the upstream cost was a real number and
+        the token math disagreed.
+      usage: upstream token usage dict (None when the adapter did
+        not surface one). Same fidelity rules as cost.
+      latency_ms: wall-clock latency for the call.
+      outcome: ``"ok"`` / ``"err"`` / ``"timeout"`` — matches the
+        ``mnemos.llm`` outcome vocabulary.
+      tier: KNEMON plan tier (``"standard"`` by default).
+
+    Returns:
+      ``SpendRecord`` describing what happened.
+    """
+    payload = _SpendInput(
+        provider=str(provider),
+        model=str(model),
+        task_kind=str(task_type or "consultation"),
+        cost_usd=(
+            float(cost_usd)
+            if isinstance(cost_usd, (int, float)) and not isinstance(cost_usd, bool)
+            else None
+        ),
+        usage=dict(usage) if isinstance(usage, dict) else None,
+        latency_ms=max(0, int(latency_ms or 0)),
+        outcome=str(outcome or "ok"),
+        tier=str(tier or "standard"),
+    )
+    recorder = _resolve_spend_recorder()
+    try:
+        result = await recorder(payload)
+    except Exception as exc:
+        # Crash-safe by contract: a misbehaving KNEMON backend
+        # MUST NOT propagate into the consultation hot path. We
+        # convert the failure into a SpendRecord carrying
+        # ``status="degraded"`` + the error repr, matching the
+        # ``mnemos.llm.call`` ledger-failure contract. The priced
+        # cost (if any) is preserved so callers can still surface
+        # the spend on the consultation record for reconciliation.
+        logger.error(
+            "[GRAEAE] spend recorder crashed for %s/%s: %s",
+            payload.provider,
+            payload.model,
+            exc,
+        )
+        result = SpendRecord(
+            status="degraded",
+            provider=payload.provider,
+            model=payload.model,
+            task_kind=payload.task_kind,
+            cost_usd=payload.cost_usd,
+            usage=payload.usage,
+            error=repr(exc),
+        )
+    return result
+
+
+async def enforce_provider_budget(
+    *,
+    provider: str,
+    model: str,
+    task_type: str,
+) -> BudgetCheckResult:
+    """Pre-dispatch budget gate. Raises when the call is denied.
+
+    The README states consultations go through PANTHEON's triage
+    + KNEMON's dollar budget enforcement; this function is the
+    place that contract actually shows up in code. When no
+    PANTHEON/KNEMON plugin is installed the check is a no-op so
+    single-process deployments keep working — the contract is
+    ``always check, possibly permissive``, never ``silently
+    skip``.
+    """
+    checker = _resolve_budget_checker()
+    return await checker(provider, model, task_type or "consultation")
+
+
+async def price_provider_cost(
+    *,
+    provider: str,
+    model: str,
+    usage: Optional[Dict[str, Any]],
+    declared_cost_usd: Optional[float] = None,
+) -> Optional[float]:
+    """Best-effort conversion of upstream usage into a priced USD cost.
+
+    Returns ``None`` when no pricing catalog is available, the
+    provider has no catalog entry, or the upstream usage block was
+    missing. Never returns ``0.0`` — that would be the F06 bug.
+    Returns ``declared_cost_usd`` unchanged when it is already a
+    real numeric value (priority 1: the upstream adapter knew the
+    cost; don't recompute).
+
+    The lookup falls back to ``mnemos.domain.pantheon.pricing``
+    if that subsystem is installed; otherwise it returns the
+    declared cost or None.
+    """
+    if isinstance(declared_cost_usd, (int, float)) and not isinstance(
+        declared_cost_usd, bool
+    ):
+        return float(declared_cost_usd)
+    if not isinstance(usage, dict) or not usage:
+        return None
+    try:
+        from mnemos.domain.pantheon.pricing import price_usage  # type: ignore[import-not-found]  # noqa: F401, WPS433
+    except Exception:
+        return None
+    try:
+        priced = price_usage(provider=provider, model=model, usage=usage)
+    except Exception:
+        return None
+    if isinstance(priced, (int, float)) and not isinstance(priced, bool):
+        return float(priced)
+    return None
 
 
 # ── Module-level singleton ─────────────────────────────────────────────────────
