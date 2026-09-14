@@ -1082,3 +1082,331 @@ class _FakeCache:
 
     def stats(self) -> dict:
         return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Gateway route() and route_stream() must also call the budget gate
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_route_path_calls_enforce_provider_budget_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single-provider gateway path (``route()``) must invoke
+    the PANTHEON/KNEMON budget gate BEFORE any provider dispatch —
+    same contract as ``consult()``. Before this fix, ``route()``
+    bypassed both PANTHEON and KNEMON entirely, which is the same
+    underbilling hole as the consultation path. After the fix, a
+    KNEMON budget denial refuses the call and no provider worker
+    is invoked, no spend record is produced.
+    """
+    from mnemos.domain.graeae import engine as engine_module
+
+    invocations: list[Dict[str, str]] = []
+
+    async def _budget_gate(provider: str, model: str, task_kind: str) -> BudgetCheckResult:
+        invocations.append(
+            {"provider": provider, "model": model, "task_kind": task_kind}
+        )
+        return BudgetCheckResult(
+            allowed=False,
+            provider=provider,
+            model=model,
+            task_kind=task_kind,
+            remaining_usd=0.0,
+            reason="F06-test: gateway budget denied",
+        )
+
+    spend_invocations: list[Any] = []
+
+    async def _spend_recorder(payload: Any) -> SpendRecord:
+        spend_invocations.append(payload)
+        return SpendRecord(
+            status="ok",
+            provider=payload.provider,
+            model=payload.model,
+            task_kind=payload.task_kind,
+            cost_usd=payload.cost_usd,
+            usage=payload.usage,
+        )
+
+    engine = get_graeae_engine()
+    engine.providers = {
+        "alpha": {
+            "url": "https://example.invalid/v1/chat/completions",
+            "model": "alpha-model",
+            "weight": 0.95,
+            "api": "openai",
+            "key_name": "alpha",
+        },
+    }
+
+    dispatched: list[str] = []
+
+    async def _fake_worker(_request: ProviderQueryRequest) -> ProviderQueryResponse:
+        dispatched.append(_request.provider)
+        return ProviderQueryResponse(
+            response_text="should-not-be-called",
+            latency_ms=0,
+            status="unavailable",
+            cost=None,
+            model_id_used="alpha-model",
+            raw_provider_payload={"status": "unavailable"},
+        )
+
+    engine.provider_worker = _fake_worker
+    engine._circuit_breakers = _FakeBreakers()
+    engine._rate_limiters = _FakeBreakers()
+    engine._concurrency = _FakeConcurrency()
+    engine._quality = _FakeQuality({"alpha": 0.95})
+    engine._cache = _FakeCache()
+
+    prev_spend = engine_module._spend_recorder
+    prev_budget = engine_module._budget_checker
+    engine_module.configure_accounting_contract(
+        spend_recorder=_spend_recorder,
+        budget_checker=_budget_gate,
+    )
+    monkeypatch.setattr(engine_module, "load_cached_weights", lambda: None)
+    monkeypatch.setattr(
+        "mnemos.domain.graeae.engine.get_key",
+        lambda _name: "fake-key",
+    )
+    try:
+        with pytest.raises(ProviderBudgetExceeded):
+            await engine.route(
+                "alpha",
+                "alpha-model",
+                "hello",
+                task_type="chat",
+                timeout=10,
+            )
+    finally:
+        engine_module._spend_recorder = prev_spend
+        engine_module._budget_checker = prev_budget
+
+    # The gate must have been called at least once with the
+    # gateway's task_kind — that's the F06 wiring.
+    assert len(invocations) >= 1
+    assert all(inv["task_kind"] == "chat" for inv in invocations), invocations
+    # And critically: NO provider dispatch happened. The gate
+    # refused the call before any work began.
+    assert dispatched == [], (
+        "gateway route() must NOT dispatch providers after a KNEMON "
+        "budget denial. Got: %r" % (dispatched,)
+    )
+    assert spend_invocations == [], (
+        "no spend records should be produced when the budget gate "
+        "refused the gateway call before dispatch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_route_path_records_spend_after_successful_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful gateway ``route()`` calls must record a
+    SpendRecord carrying the priced cost and the upstream usage,
+    mirroring the consultation fan-out's contract. Without this,
+    a single-provider gateway call bypasses KNEMON's ledger — the
+    other half of the F06 underbilling hole."""
+    from mnemos.domain.graeae import engine as engine_module
+
+    spend_invocations: list[Any] = []
+
+    async def _spend_recorder(payload: Any) -> SpendRecord:
+        spend_invocations.append(payload)
+        return SpendRecord(
+            status="ok",
+            provider=payload.provider,
+            model=payload.model,
+            task_kind=payload.task_kind,
+            cost_usd=payload.cost_usd,
+            usage=payload.usage,
+            record_id=len(spend_invocations),
+        )
+
+    engine = get_graeae_engine()
+    engine.providers = {
+        "alpha": {
+            "url": "https://example.invalid/v1/chat/completions",
+            "model": "alpha-model",
+            "weight": 0.95,
+            "api": "openai",
+            "key_name": "alpha",
+        },
+    }
+
+    async def _fake_worker(request: ProviderQueryRequest) -> ProviderQueryResponse:
+        return ProviderQueryResponse(
+            response_text="alpha says hi",
+            latency_ms=42,
+            status="success",
+            cost=None,
+            model_id_used="alpha-model",
+            raw_provider_payload={
+                "status": "success",
+                "response_text": "alpha says hi",
+                "latency_ms": 42,
+                "model_id": "alpha-model",
+                "usage": {"prompt_tokens": 11, "completion_tokens": 4},
+                "cost": None,
+            },
+        )
+
+    engine.provider_worker = _fake_worker
+    engine._circuit_breakers = _FakeBreakers()
+    engine._rate_limiters = _FakeBreakers()
+    engine._concurrency = _FakeConcurrency()
+    engine._quality = _FakeQuality({"alpha": 0.95})
+    engine._cache = _FakeCache()
+
+    prev_spend = engine_module._spend_recorder
+    prev_budget = engine_module._budget_checker
+    engine_module.configure_accounting_contract(
+        spend_recorder=_spend_recorder,
+        budget_checker=None,  # permissive
+    )
+    monkeypatch.setattr(engine_module, "load_cached_weights", lambda: None)
+    monkeypatch.setattr(
+        "mnemos.domain.graeae.engine.get_key",
+        lambda _name: "fake-key",
+    )
+    try:
+        result = await engine.route(
+            "alpha",
+            "alpha-model",
+            "hello",
+            task_type="chat",
+            timeout=10,
+        )
+    finally:
+        engine_module._spend_recorder = prev_spend
+        engine_module._budget_checker = prev_budget
+
+    assert result["status"] == "success"
+    assert len(spend_invocations) == 1
+    rec = spend_invocations[0]
+    assert rec.provider == "alpha"
+    assert rec.model == "alpha-model"
+    assert rec.task_kind == "chat"
+    assert rec.usage == {"prompt_tokens": 11, "completion_tokens": 4}
+    assert rec.cost_usd is None  # not coerced to 0.0
+
+
+@pytest.mark.asyncio
+async def test_route_stream_path_calls_enforce_provider_budget_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The streaming gateway path (``route_stream()``) must also
+    invoke the PANTHEON/KNEMON budget gate BEFORE any chunk is
+    generated. Without this, a streaming gateway endpoint would
+    bypass the budget enforcement even when KNEMON denies the
+    call, opening a separate underbilling hole on the stream
+    surface.
+    """
+    from mnemos.domain.graeae import engine as engine_module
+
+    invocations: list[Dict[str, str]] = []
+
+    async def _budget_gate(provider: str, model: str, task_kind: str) -> BudgetCheckResult:
+        invocations.append(
+            {"provider": provider, "model": model, "task_kind": task_kind}
+        )
+        return BudgetCheckResult(
+            allowed=False,
+            provider=provider,
+            model=model,
+            task_kind=task_kind,
+            remaining_usd=0.0,
+            reason="F06-test: stream budget denied",
+        )
+
+    spend_invocations: list[Any] = []
+
+    async def _spend_recorder(payload: Any) -> SpendRecord:
+        spend_invocations.append(payload)
+        return SpendRecord(
+            status="ok",
+            provider=payload.provider,
+            model=payload.model,
+            task_kind=payload.task_kind,
+            cost_usd=payload.cost_usd,
+            usage=payload.usage,
+        )
+
+    engine = get_graeae_engine()
+    engine.providers = {
+        "alpha": {
+            "url": "https://example.invalid/v1/chat/completions",
+            "model": "alpha-model",
+            "weight": 0.95,
+            "api": "openai",
+            "key_name": "alpha",
+        },
+    }
+
+    dispatched: list[str] = []
+
+    async def _fake_worker(_request: ProviderQueryRequest) -> ProviderQueryResponse:
+        dispatched.append(_request.provider)
+        return ProviderQueryResponse(
+            response_text="should-not-be-called",
+            latency_ms=0,
+            status="unavailable",
+            cost=None,
+            model_id_used="alpha-model",
+            raw_provider_payload={"status": "unavailable"},
+        )
+
+    engine.provider_worker = _fake_worker
+    engine._circuit_breakers = _FakeBreakers()
+    engine._rate_limiters = _FakeBreakers()
+    engine._concurrency = _FakeConcurrency()
+    engine._quality = _FakeQuality({"alpha": 0.95})
+    engine._cache = _FakeCache()
+
+    prev_spend = engine_module._spend_recorder
+    prev_budget = engine_module._budget_checker
+    engine_module.configure_accounting_contract(
+        spend_recorder=_spend_recorder,
+        budget_checker=_budget_gate,
+    )
+    monkeypatch.setattr(engine_module, "load_cached_weights", lambda: None)
+    monkeypatch.setattr(
+        "mnemos.domain.graeae.engine.get_key",
+        lambda _name: "fake-key",
+    )
+    try:
+        # Drain the generator. The budget gate is an async-pre-yield
+        # check, so the first await on the generator (next()) raises.
+        agen = engine.route_stream(
+            "alpha",
+            "alpha-model",
+            "hello",
+            task_type="stream",
+            timeout=10,
+        )
+        with pytest.raises(ProviderBudgetExceeded):
+            await agen.__anext__()
+        # Drain the async generator to avoid "never awaited" warnings.
+        try:
+            while True:
+                await agen.__anext__()
+        except (StopAsyncIteration, ProviderBudgetExceeded):
+            pass
+    finally:
+        engine_module._spend_recorder = prev_spend
+        engine_module._budget_checker = prev_budget
+
+    assert len(invocations) >= 1
+    assert all(inv["task_kind"] == "stream" for inv in invocations), invocations
+    assert dispatched == [], (
+        "streaming gateway route_stream() must NOT dispatch "
+        "providers after a KNEMON budget denial. Got: %r" % (dispatched,)
+    )
+    assert spend_invocations == [], (
+        "no spend records should be produced when the budget gate "
+        "refused the streaming gateway call before dispatch"
+    )

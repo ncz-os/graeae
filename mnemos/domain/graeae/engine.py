@@ -1738,6 +1738,41 @@ class GraeaeEngine:
                 provider_config["model"],
                 error=f"provider '{provider}' rate-limited",
             )
+
+        # ── F06: PANTHEON/KNEMON budget pre-flight (gateway path) ────────
+        # The README documents that every GRAEAE provider call goes
+        # through PANTHEON's routing + KNEMON's dollar budget. Before
+        # this fix the gateway path invoked the adapter directly,
+        # bypassing both — the SAME underbilling hole as the
+        # consultation fan-out, just on the gateway surface. Mirror
+        # the consult() gate here so a single-provider gateway call
+        # is also refused when KNEMON's per-plan cap is exhausted.
+        # The check is a no-op when no budget subsystem is installed.
+        # Run BEFORE concurrency.acquire so a denied call does not
+        # hold a slot — same order as the consult() flow.
+        try:
+            check = await enforce_provider_budget(
+                provider=provider,
+                model=model or provider_config["model"],
+                task_type=str(task_type or "chat"),
+            )
+            if not check.allowed:
+                logger.warning(
+                    "[GRAEAE] route(%s) refused by KNEMON budget gate: "
+                    "remaining_usd=%s reason=%s",
+                    provider,
+                    check.remaining_usd,
+                    check.reason,
+                )
+                check.raise_if_denied()
+        except ProviderBudgetExceeded:
+            raise
+        except Exception as exc:
+            # Don't let a misconfigured budget checker take down the
+            # gateway path — log + carry on, matching the
+            # consult() tolerance.
+            logger.error("[GRAEAE] route(%s) budget gate raised unexpectedly: %s", provider, exc)
+
         concurrency = self._get_concurrency()
         if not await call_maybe_async(concurrency.acquire, provider):
             logger.info("[GRAEAE] route(%s) refused: concurrency saturated", provider)
@@ -1871,6 +1906,39 @@ class GraeaeEngine:
             raise RuntimeError(f"provider '{provider}' circuit open")
         if not await call_maybe_async(self._rate_limiters.is_allowed, provider):
             raise RuntimeError(f"provider '{provider}' rate-limited")
+
+        # ── F06: PANTHEON/KNEMON budget pre-flight (streaming gateway) ───
+        # Streaming gateway traffic is the third provider-invocation
+        # surface in GRAEAE — same documented contract as consult()
+        # and route(): refuse the call BEFORE any chunk is generated
+        # when KNEMON's per-plan dollar cap is exhausted. No-op when
+        # no budget subsystem is installed (single-process / test
+        # deployments keep working). Run BEFORE concurrency.acquire
+        # so a denied call does not hold a slot.
+        try:
+            check = await enforce_provider_budget(
+                provider=provider,
+                model=model or provider_config["model"],
+                task_type=str(task_type or "stream"),
+            )
+            if not check.allowed:
+                logger.warning(
+                    "[GRAEAE] route_stream(%s) refused by KNEMON budget gate: "
+                    "remaining_usd=%s reason=%s",
+                    provider,
+                    check.remaining_usd,
+                    check.reason,
+                )
+                check.raise_if_denied()
+        except ProviderBudgetExceeded:
+            raise
+        except Exception as exc:
+            logger.error(
+                "[GRAEAE] route_stream(%s) budget gate raised unexpectedly: %s",
+                provider,
+                exc,
+            )
+
         concurrency = self._get_concurrency()
         if not await call_maybe_async(concurrency.acquire, provider):
             raise RuntimeError(f"provider '{provider}' concurrency saturated")
