@@ -19,7 +19,7 @@ ruff:
 
 pytest:
   stage: check
-  image: python:3.12-slim
+  image: python:3.13-slim
   before_script:
     # This distribution is a PEP 420 namespace layer on mnemos-core. CI checks
     # out core beside it and installs both editably, matching split-repository
