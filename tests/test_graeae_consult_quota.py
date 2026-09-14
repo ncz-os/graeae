@@ -484,6 +484,40 @@ class _FakeOracleConn:
         return _FakeOracleCursor()
 
 
+class _FakeRealOracleCursor:
+    """Shaped like REAL python-oracledb's AsyncCursor, not the earlier fake.
+
+    execute/fetchone are coroutines, but close() is a plain synchronous
+    call returning None -- no DB round trip needed to close a cursor.
+    Awaiting it unconditionally raised ``TypeError: object NoneType
+    can't be used in 'await' expression`` against real production
+    Oracle (2026-09-14), even after the initial conn.cursor()-await bug
+    was fixed -- this fake reproduces that second, more subtle shape.
+    """
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, Any]] = []
+        self.closed = False
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self.executed.append((sql, params))
+
+    async def fetchone(self) -> tuple | None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeRealOracleConn:
+    def __init__(self) -> None:
+        self.cursor_calls = 0
+
+    def cursor(self) -> _FakeRealOracleCursor:
+        self.cursor_calls += 1
+        return _FakeRealOracleCursor()
+
+
 @pytest.mark.parametrize("backend_name", ["OracleBackend", "Db2Backend", "Db2BackendNative"])
 @pytest.mark.asyncio
 async def test_lock_quota_row_for_update_does_not_await_cursor(
@@ -527,7 +561,7 @@ async def test_enforce_consult_quota_succeeds_against_oracle_shaped_backend(
 
     conn = _FakeOracleConn()
 
-    class OracleBackend:  # noqa: N801 - name matters, matched by dispatch
+    class OracleBackend:  # noqa: N801
         state_kv = _InMemoryStateRepository()
 
         @asynccontextmanager
@@ -540,4 +574,57 @@ async def test_enforce_consult_quota_succeeds_against_oracle_shaped_backend(
     # Must not raise. Before the fix, this failed with HTTPException(503,
     # "Shared consultation quota storage is unavailable.") every time.
     await consultations._enforce_consult_quota("oracle-user@example.com", "auto")
+    assert conn.cursor_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_lock_quota_row_for_update_handles_sync_cursor_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: cursor.close() must not be unconditionally awaited.
+
+    Found live against real production Oracle (2026-09-14), AFTER the
+    initial conn.cursor()-await fix shipped: real python-oracledb's
+    AsyncCursor.close() is a plain synchronous call returning None (no
+    DB round trip needed to close a cursor) -- unlike execute/fetchone,
+    which genuinely are coroutines on that same cursor. The finally
+    block's bare ``await cursor.close()`` raised ``TypeError: object
+    NoneType can't be used in 'await' expression``, still producing the
+    user-visible 503 even with the first fix live. This uses a fake
+    shaped like the REAL driver (sync close), not the earlier fake
+    (which happened to make close() a coroutine and didn't catch this).
+    """
+
+    fake_backend_cls = type("OracleBackend", (), {})
+    monkeypatch.setattr(consultations._lc, "_persistence_backend", fake_backend_cls())
+
+    conn = _FakeRealOracleConn()
+    tx = SimpleNamespace(conn=conn)
+
+    # Must not raise TypeError. Before this fix, it always did.
+    await consultations._lock_quota_row_for_update(tx, "principal-oracle-realshape")
+
+    assert conn.cursor_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_enforce_consult_quota_succeeds_against_real_oracle_cursor_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end with the REAL-shaped fake (sync close()) -- the exact
+    production symptom reported live on 2026-09-14 against Oracle."""
+
+    conn = _FakeRealOracleConn()
+
+    class OracleBackend:
+        state_kv = _InMemoryStateRepository()
+
+        @asynccontextmanager
+        async def transactional(self):
+            yield SimpleNamespace(conn=conn)
+
+    _patch_backend(monkeypatch, OracleBackend())
+    _patch_quota_env(monkeypatch, quota=20.0)
+
+    await consultations._enforce_consult_quota("oracle-user-2@example.com", "auto")
     assert conn.cursor_calls == 1

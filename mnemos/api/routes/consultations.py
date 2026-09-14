@@ -6,6 +6,7 @@
 
 import hashlib
 import hmac
+import inspect
 import json
 
 from mnemos.core import audit_chain
@@ -188,6 +189,22 @@ def _advisory_lock_key(principal_key: str) -> int:
     return key
 
 
+async def _maybe_await(value: Any) -> Any:
+    """Await ``value`` only if it's actually awaitable.
+
+    Oracle/Db2 cursor methods have an inconsistent sync/async surface
+    across drivers and wrappers: real python-oracledb's ``AsyncCursor
+    .close()`` is a plain synchronous call returning ``None`` (closing
+    a cursor needs no DB round trip), while this repo's own
+    ``Db2BackendNative`` cursor wrapper makes ``close()`` a coroutine.
+    Awaiting unconditionally 503'd every real Oracle consultation with
+    ``TypeError: object NoneType can't be used in 'await' expression``
+    even after the initial ``conn.cursor()``-await bug was fixed
+    (2026-09-14) -- this normalizes both shapes instead of assuming one.
+    """
+    return await value if inspect.isawaitable(value) else value
+
+
 async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
     """Take a row-level lock on the (owner_id, namespace, key) quota row.
 
@@ -199,7 +216,11 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
         lock earlier in this file.
       * Oracle / Db2: ``conn.cursor()`` (no await — cursor creation is
         not an I/O operation in either driver) then SELECT ... FOR
-        UPDATE on the ``state`` row.
+        UPDATE on the ``state`` row. ``execute``/``fetchone`` are
+        coroutines on both drivers, but ``close()`` is NOT consistently
+        one — real python-oracledb's is a plain sync call, while this
+        repo's Db2BackendNative wrapper's is a coroutine — so ``close()``
+        goes through ``_maybe_await`` rather than a bare ``await``.
       * MySQL / MariaDB: ``async with conn.cursor() as cursor`` then
         SELECT ... FOR UPDATE. aiomysql returns a context-manager cursor
         from ``conn.cursor()`` directly.
@@ -259,7 +280,7 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
                     drain_exc,
                 )
         finally:
-            await cursor.close()
+            await _maybe_await(cursor.close())
         return
 
     if backend_name in {"MysqlBackend", "MariadbBackend"}:
