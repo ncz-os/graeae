@@ -155,3 +155,189 @@ async def test_lock_quota_row_for_update_mysql_renders_backticked_sql(
         consultations._QUOTA_NAMESPACE,
         "principal-mysql",
     )
+
+
+@pytest.mark.asyncio
+async def test_lock_quota_row_for_update_mariadb_renders_backticked_sql(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """MariaDB shares the MySQL branch — confirm it gets the same dialect-correct SQL.
+
+    MariaDB 10.x has the same reserved-word issue as MySQL 8.0+ for ``KEY``,
+    so the backticked `` `key` `` form must apply to both. The previous fix
+    routed both backends through the same ``_mysql_lock_sql`` helper; this
+    test pins that the MariaBackend-shaped type still hits the backticked path
+    rather than falling through to the bare-SQL Oracle/DB2 branch or the
+    default Sqlite path.
+    """
+    executed: list[tuple[str, tuple]] = []
+
+    class _FakeMysqlCursor:
+        async def execute(self, sql: str, params: tuple | None = None) -> None:
+            executed.append((sql, params))
+
+        async def fetchone(self) -> tuple | None:
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class _FakeMysqlConn:
+        def cursor(self) -> _FakeMysqlCursor:
+            return _FakeMysqlCursor()
+
+    fake_backend_cls = type("MariadbBackend", (), {})
+    monkeypatch.setattr(consultations._lc, "_persistence_backend", fake_backend_cls())
+
+    tx = type("Tx", (), {"conn": _FakeMysqlConn()})()
+
+    await consultations._lock_quota_row_for_update(tx, "principal-mariadb")
+
+    assert len(executed) == 1, (
+        f"MariaDB branch expected exactly 1 execute call, got {executed!r}"
+    )
+    sql, params = executed[0]
+    assert "`key`" in sql, (
+        f"MariaDB execute must backtick-quote `key` (also a reserved word "
+        f"in MariaDB) — got: {sql!r}"
+    )
+    assert "`owner_id`" in sql
+    assert "`namespace`" in sql
+    assert "FOR UPDATE" in sql.upper()
+
+
+@pytest.mark.asyncio
+async def test_lock_quota_row_for_update_postgres_uses_advisory_lock(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Postgres branch uses ``pg_advisory_xact_lock`` — no SQL identifier
+    quoting is required there because the lock is on an int8 derived from
+    the principal hash, not on a state_kv column whose name might be
+    reserved. Pin that the Postgres branch still uses the advisory-lock
+    path (so an accidental move of the SQL branch into Postgres would
+    fail this test)."""
+
+    executed: list[tuple[str, object]] = []
+
+    class _FakeAsyncpgConn:
+        async def execute(self, sql: str, *args) -> None:
+            executed.append((sql, args))
+
+    fake_backend_cls = type("PostgresBackend", (), {})
+    monkeypatch.setattr(consultations._lc, "_persistence_backend", fake_backend_cls())
+
+    tx = type("Tx", (), {"conn": _FakeAsyncpgConn()})()
+
+    await consultations._lock_quota_row_for_update(tx, "principal-pg")
+
+    assert len(executed) == 1, (
+        f"Postgres branch expected exactly 1 execute call, got {executed!r}"
+    )
+    sql, arg = executed[0]
+    assert "pg_advisory_xact_lock" in sql, (
+        f"Postgres branch must use pg_advisory_xact_lock, not the SELECT FOR "
+        f"UPDATE row lock — got: {sql!r}"
+    )
+    # The bind is a stable int8 derived from the principal.
+    assert isinstance(arg, tuple) and len(arg) == 1
+    assert isinstance(arg[0], int)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "backend_name",
+    ["OracleBackend", "Db2Backend", "Db2BackendNative"],
+)
+async def test_lock_quota_row_for_update_oracle_db2_uses_bind_params(
+    monkeypatch: pytest.MonkeyPatch,
+    backend_name: str,
+):
+    """Oracle/Db2 branch uses named bind params (``owner_id``, ``namespace``,
+    ``key``). The bare ``SELECT key FROM state`` is correct on those
+    backends because the ``key`` literal is a SQL identifier on Oracle
+    (not reserved) and a column reference on Db2 (also not reserved in
+    SELECT/WHERE contexts — Db2's reserved-word rule applies to DDL, not
+    to plain SELECT against a real column named ``key``). This test pins
+    the dialect-correct shape across all three Oracle/Db2 backends."""
+
+    executed: list[tuple[str, dict]] = []
+
+    class _FakeOracleCursor:
+        async def execute(self, sql: str, params: dict | None = None) -> None:
+            executed.append((sql, params))
+
+        async def fetchone(self) -> tuple | None:
+            return None
+
+        def close(self) -> None:  # synchronous on oracledb async connection
+            pass
+
+    class _FakeOracleConn:
+        def cursor(self) -> _FakeOracleCursor:
+            return _FakeOracleCursor()
+
+    fake_backend_cls = type(backend_name, (), {})
+    monkeypatch.setattr(consultations._lc, "_persistence_backend", fake_backend_cls())
+
+    tx = type("Tx", (), {"conn": _FakeOracleConn()})()
+
+    await consultations._lock_quota_row_for_update(tx, "principal-oracle")
+
+    assert len(executed) == 1, (
+        f"{backend_name} branch expected exactly 1 execute call, got "
+        f"{executed!r}"
+    )
+    sql, params = executed[0]
+    assert sql.startswith("SELECT"), (
+        f"{backend_name} lock SQL must start with SELECT — got: {sql!r}"
+    )
+    assert "FROM state" in sql
+    assert "FOR UPDATE" in sql.upper()
+    # The Oracle/DB2 form uses named bind params (``:key`` etc.), NOT
+    # backticks (`` `key` ``) and NOT positional ``%s``.
+    assert ":owner_id" in sql
+    assert ":namespace" in sql
+    assert ":key" in sql
+    assert "`" not in sql, (
+        f"{backend_name} branch must not use MySQL backticks — got: {sql!r}"
+    )
+    assert "%s" not in sql, (
+        f"{backend_name} branch uses named params, not %s — got: {sql!r}"
+    )
+    assert isinstance(params, dict)
+    assert params["owner_id"] == consultations._QUOTA_OWNER_ID
+    assert params["namespace"] == consultations._QUOTA_NAMESPACE
+    assert params["key"] == "principal-oracle"
+
+
+@pytest.mark.asyncio
+async def test_lock_quota_row_for_update_sqlite_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Sqlite + any other backend (no specific branch): ``BEGIN IMMEDIATE``
+    already holds a RESERVED write lock on the writer connection, so no
+    extra statement is needed. Pin that the lock function executes
+    *zero* cursor.execute calls on Sqlite-shaped backends."""
+
+    executed: list[tuple[str, object]] = []
+
+    class _FakeSqliteConn:
+        def cursor(self):  # pragma: no cover - never called on Sqlite branch
+            raise AssertionError(
+                "Sqlite branch must not call conn.cursor() — BEGIN IMMEDIATE "
+                "already holds the lock."
+            )
+
+    fake_backend_cls = type("SqliteBackend", (), {})
+    monkeypatch.setattr(consultations._lc, "_persistence_backend", fake_backend_cls())
+
+    tx = type("Tx", (), {"conn": _FakeSqliteConn()})()
+
+    # Should not raise.
+    await consultations._lock_quota_row_for_update(tx, "principal-sqlite")
+    assert executed == [], (
+        f"Sqlite branch must not issue any extra SQL — got: {executed!r}"
+    )
