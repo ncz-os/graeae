@@ -439,3 +439,105 @@ def test_advisory_lock_key_is_stable_signed_int64():
     # Different principals get different keys (collision-resistant).
     other = consultations._advisory_lock_key("principal-xyz")
     assert other != key1
+
+
+# ── Oracle/Db2 row-lock regression (2026-09-14) ────────────────────────────────
+#
+# Every test above passes SimpleNamespace(conn=None), so
+# _lock_quota_row_for_update's `if conn is None: return` early-exit meant
+# NONE of them ever touched the Oracle/Db2/MySQL branches below it. That let
+# `cursor = await conn.cursor()` ship for months: cursor() is synchronous on
+# both python-oracledb's async connection and this repo's own
+# Db2BackendNative wrapper (mnemos/persistence/db2.py::
+# _Db2NativeAsyncConnection.cursor, also a plain `def`, not `async def`) --
+# only execute/fetch/close are coroutines. Awaiting the plain cursor object
+# raised `TypeError: object AsyncCursor can't be used in 'await' expression`,
+# which took every GRAEAE consultation down with a 503 in production.
+
+
+class _FakeOracleCursor:
+    """Shaped like python-oracledb's AsyncCursor / _Db2NativeAsyncCursor:
+    execute/fetchone/close are coroutines, the cursor object itself is not."""
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, Any]] = []
+        self.closed = False
+
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self.executed.append((sql, params))
+
+    async def fetchone(self) -> tuple | None:
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeOracleConn:
+    """cursor() is a plain (synchronous) method — the real defect surface."""
+
+    def __init__(self) -> None:
+        self.cursor_calls = 0
+
+    def cursor(self) -> _FakeOracleCursor:
+        self.cursor_calls += 1
+        return _FakeOracleCursor()
+
+
+@pytest.mark.parametrize("backend_name", ["OracleBackend", "Db2Backend", "Db2BackendNative"])
+@pytest.mark.asyncio
+async def test_lock_quota_row_for_update_does_not_await_cursor(
+    monkeypatch: pytest.MonkeyPatch, backend_name: str
+) -> None:
+    """Regression: cursor() must not be awaited for Oracle/Db2 backends.
+
+    `_lock_quota_row_for_update` dispatches on
+    `type(mnemos.core.lifecycle._persistence_backend).__name__` (a module
+    global, not anything derived from `tx`) — so the fake backend class
+    must be patched into `lifecycle._persistence_backend`, and its class
+    name must exactly match one of the dispatch strings. `tx.conn`'s
+    cursor() is synchronous, matching both real python-oracledb and this
+    repo's own Db2BackendNative wrapper.
+    """
+
+    fake_backend_cls = type(backend_name, (), {})
+    monkeypatch.setattr(consultations._lc, "_persistence_backend", fake_backend_cls())
+
+    conn = _FakeOracleConn()
+    tx = SimpleNamespace(conn=conn)
+
+    await consultations._lock_quota_row_for_update(tx, "principal-oracle-test")
+
+    assert conn.cursor_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_enforce_consult_quota_succeeds_against_oracle_shaped_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: a consult against an Oracle-shaped backend must not 503.
+
+    This is the actual user-visible symptom from production: every
+    /v1/consultations call failed with 503 "Shared consultation quota
+    storage is unavailable." because _lock_quota_row_for_update's
+    TypeError was caught by _enforce_consult_quota's broad except-Exception
+    and re-raised with that message. Reproduces it end-to-end through the
+    public function, not just the row-lock helper in isolation.
+    """
+
+    conn = _FakeOracleConn()
+
+    class OracleBackend:  # noqa: N801 - name matters, matched by dispatch
+        state_kv = _InMemoryStateRepository()
+
+        @asynccontextmanager
+        async def transactional(self):
+            yield SimpleNamespace(conn=conn)
+
+    _patch_backend(monkeypatch, OracleBackend())
+    _patch_quota_env(monkeypatch, quota=20.0)
+
+    # Must not raise. Before the fix, this failed with HTTPException(503,
+    # "Shared consultation quota storage is unavailable.") every time.
+    await consultations._enforce_consult_quota("oracle-user@example.com", "auto")
+    assert conn.cursor_calls == 1

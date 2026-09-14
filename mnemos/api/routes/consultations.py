@@ -197,9 +197,9 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
       * Postgres: pg_advisory_xact_lock(int64) keyed on a stable hash of
         the principal. Same proven pattern as the audit-chain advisory
         lock earlier in this file.
-      * Oracle / Db2: ``await conn.cursor()`` then SELECT ... FOR UPDATE
-        on the ``state`` row. python-oracledb's async API returns an
-        ``AsyncCursor`` from ``await conn.cursor()``.
+      * Oracle / Db2: ``conn.cursor()`` (no await — cursor creation is
+        not an I/O operation in either driver) then SELECT ... FOR
+        UPDATE on the ``state`` row.
       * MySQL / MariaDB: ``async with conn.cursor() as cursor`` then
         SELECT ... FOR UPDATE. aiomysql returns a context-manager cursor
         from ``conn.cursor()`` directly.
@@ -226,9 +226,14 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
         return
 
     if backend_name in {"OracleBackend", "Db2Backend", "Db2BackendNative"}:
-        # python-oracledb async API: ``await conn.cursor()`` returns an
-        # AsyncCursor (with __aenter__/__aexit__).
-        cursor = await conn.cursor()
+        # cursor() is synchronous on both python-oracledb's async
+        # connection and this repo's own Db2BackendNative wrapper
+        # (mnemos/persistence/db2.py::_Db2NativeAsyncConnection.cursor) --
+        # only execute/fetch are coroutines. Awaiting the plain cursor
+        # object raises TypeError: object AsyncCursor can't be used in
+        # 'await' expression, which took every consultation down with a
+        # 503 in production (2026-09-14).
+        cursor = conn.cursor()
         try:
             await cursor.execute(
                 "SELECT key FROM state "
