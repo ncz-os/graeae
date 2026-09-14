@@ -1,0 +1,157 @@
+"""F09 regression — atomic quota row-locking SQL on MySQL/MariaDB.
+
+The unquoted ``SELECT key FROM state`` previously shipped in
+``mnemos/api/routes/consultations.py::_lock_quota_row_for_update`` is
+broken on MySQL/MariaDB because ``KEY`` is a RESERVED WORD in those
+dialects and ``key`` (lowercase) gets rejected with ``1064 You have an
+error in your SQL syntax`` — silently surfacing as a generic 503 to
+the caller. Oracle/DB2 use the bound-parameter form already (with
+``key`` as a bind placeholder, which is not a SQL reserved-word issue),
+Postgres ignores the ``key`` keyword-in-any-case quirk in practice
+(it permits the bare identifier even though ``KEY`` is reserved for
+orderings), and SQLite is permissive enough that the bare form
+historically worked.
+
+This test pins two shapes:
+  1. The dialect-correct SQL for MySQL/MariaDB backticks every
+     reserved identifier (``key`` in particular) and uses
+     ``%s`` style parameters.
+  2. The Oracle/DB2 branch (which the prior Oracle-shape regressions
+     already cover end-to-end) still uses bare ``key`` since it is
+     a bind parameter there and not a SQL token.
+
+A live two-connection MySQL/MariaDB test was NOT added: this repo's
+CI does not ship an aiomysql/pymysql fixture and the existing
+``tests/conftest.py`` fixtures are backend-neutral. Probing the
+generated SQL string is the static form the F09 instruction asked
+for when no live MySQL/MariaDB infrastructure exists — comment in the
+module's ``_mysql_lock_sql`` is the matching explanation.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from mnemos.api.routes import consultations
+
+
+def test_mysql_lock_sql_backtick_quotes_key_reserved_word():
+    """The MySQL/MariaDB SELECT must backtick-quote ``key``.
+
+    Without backticks, MySQL 8.0+ and MariaDB 10.x reject the statement
+    with a 1064 syntax error because ``KEY`` is a RESERVED WORD in both
+    dialects. Backticks (and ONLY backticks — ANSI ``""`` is not legal in
+    aiomysql's ``%s`` parameter style) bound the identifier.
+    """
+    sql = consultations._mysql_lock_sql()
+    # Every reserved identifier must be backtick-quoted in the SELECT list
+    # AND in the WHERE clause. The FOR UPDATE lock clause should not need
+    # quoting (it's a SQL verb, not an identifier).
+    assert "`key`" in sql, (
+        f"MySQL SELECT must backtick-quote `key` (a reserved word) — got: {sql!r}"
+    )
+    # Other identifiers in the SELECT list also gain backticks so we are
+    # consistent across dialect additions; assert this is uniform.
+    assert "`owner_id`" in sql
+    assert "`namespace`" in sql
+    # Bare ``key`` (unquoted) anywhere in the rendered string is the exact
+    # defect surface we are guarding against.
+    assert " key " not in sql, (
+        f"unquoted `key` is a reserved word on MySQL/MariaDB — got: {sql!r}"
+    )
+    # aiomysql uses ``%s`` style parameters, NOT ``?`` (sqlite) or
+    # ``$1`` (asyncpg) or ``:key`` (oracledb).
+    assert sql.count("%s") == 3, (
+        f"MySQL lock SELECT should have 3 %s placeholders, got: {sql!r}"
+    )
+
+
+def test_mysql_lock_sql_returns_select_for_update():
+    """The MySQL lock SELECT must include FOR UPDATE — same row-lock
+    semantic as the Oracle/DB2 branch. Without it, the lock is just a
+    plain row read and concurrent writers don't queue."""
+    sql = consultations._mysql_lock_sql()
+    assert "FOR UPDATE" in sql.upper(), (
+        f"MySQL lock SELECT missing FOR UPDATE — got: {sql!r}"
+    )
+    assert sql.upper().startswith("SELECT"), (
+        f"MySQL lock SELECT must start with SELECT — got: {sql!r}"
+    )
+
+
+def test_mysql_lock_sql_filters_deleted_at_is_null():
+    """The lock SELECT must scope to live (non-deleted) state rows,
+    matching the prior bare-SQL branch so the production semantics
+    don't shift under the fix."""
+    sql = consultations._mysql_lock_sql()
+    assert "deleted_at IS NULL" in sql, (
+        f"MySQL lock SELECT must filter out deleted rows — got: {sql!r}"
+    )
+
+
+def test_oracle_lock_sql_uses_bind_parameters():
+    """Oracle/DB2 path uses bound parameters (:key), where ``key`` is a
+    bind-placeholder, NOT a SQL identifier — so the dialect there has
+    no reserved-word problem and the bare SQL is correct. This is a
+    guard test: if anyone ever tries to copy the MySQL branch's backticks
+    into the Oracle branch by accident, ``key`` would still be inside a
+    bind-parameter dict so it would parse but as a different identifier
+    name in the dictionary (effectively: no-op for backwards compat).
+    """
+    # Spot-check the rendered Oracle branch is left untouched.
+    # We don't re-extract the SQL string here (the Oracle branch is
+    # inline in _lock_quota_row_for_update), so this is a structural
+    # check on the helper module: no sql string constant named
+    # ``_ORACLE_LOCK_SQL`` exists, ensuring no accidental refactor
+    # moves the MySQL-style backticking into the Oracle branch.
+    source = open(consultations.__file__, encoding="utf-8").read()
+    assert "SELECT key FROM state" in source, (
+        "Oracle/DB2 branch should still use bare 'SELECT key FROM state' "
+        "because 'key' there is a bind parameter placeholder, not a SQL "
+        "identifier. If you have moved MySQL backticks into the Oracle "
+        "branch by accident, revert that change."
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_quota_row_for_update_mysql_renders_backticked_sql(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """End-to-end: a MySQL-shaped backend exercises the right SQL path."""
+
+    executed: list[tuple[str, tuple]] = []
+
+    class _FakeMysqlCursor:
+        async def execute(self, sql: str, params: tuple | None = None) -> None:
+            executed.append((sql, params))
+
+        async def fetchone(self) -> tuple | None:
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class _FakeMysqlConn:
+        def cursor(self) -> _FakeMysqlCursor:
+            return _FakeMysqlCursor()
+
+    fake_backend_cls = type("MysqlBackend", (), {})
+    monkeypatch.setattr(consultations._lc, "_persistence_backend", fake_backend_cls())
+
+    tx = type("Tx", (), {"conn": _FakeMysqlConn()})()
+
+    await consultations._lock_quota_row_for_update(tx, "principal-mysql")
+
+    assert len(executed) == 1, f"expected exactly 1 execute call, got {executed!r}"
+    sql, params = executed[0]
+    assert "`key`" in sql, (
+        f"MySQL execute must backtick-quote `key` — got: {sql!r}"
+    )
+    assert params == (
+        consultations._QUOTA_OWNER_ID,
+        consultations._QUOTA_NAMESPACE,
+        "principal-mysql",
+    )

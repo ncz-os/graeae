@@ -189,6 +189,42 @@ def _advisory_lock_key(principal_key: str) -> int:
     return key
 
 
+# Dialect-aware identifier quoting for the inline row-lock SQL we issue
+# against MySQL/MariaDB. ``key`` (and several other state_kv column names)
+# are RESERVED WORDS on MySQL/MariaDB — an unquoted ``SELECT key FROM state``
+# raises ``1064 You have an error in your SQL syntax`` on those backends.
+# Postgres/Oracle/Db2/SQLite accept ``key`` either way in practice (Oracle
+# needs lower-case quoted identifiers in real DBs but our state table was
+# created with bare ``key`` historically and Oracle treats it as the literal
+# name with no quoting required).
+#
+# Backticks are the MySQL/MariaDB convention (ANSI uses ``""`` for
+# identifiers, which Postgres also accepts but Python DB-API 2.0 does NOT
+# massage — and our Oracle/Db2 bound-parameter form below already handles
+# that family). We do not introduce a new shared utility — there is no
+# ``mnemos/persistence/`` module in this checkout, and the only consumer
+# of this inline SQL is the row-lock here — so a local helper keeps the
+# surface tight. (If a future change needs dialect-aware identifier
+# quoting elsewhere, lift this next to a `mnemos/persistence/_sql.py`
+# module and consume from there.)
+_MYSQL_QUOTED_COLUMNS = "`owner_id`, `namespace`, `key`"
+
+
+def _mysql_lock_sql() -> str:
+    """Build the dialect-correct SELECT ... FOR UPDATE statement.
+
+    Returning the rendered SQL (not the parameters) keeps this helper
+    unit-testable from a static SQL-shape assertion, which is the form
+    the fix-instruction asked for given we have no live MySQL/MariaDB
+    fixture in this repo's CI.
+    """
+    return (
+        f"SELECT {_MYSQL_QUOTED_COLUMNS} FROM state "
+        "WHERE owner_id = %s AND namespace = %s AND `key` = %s "
+        "AND deleted_at IS NULL FOR UPDATE"
+    )
+
+
 async def _maybe_await(value: Any) -> Any:
     """Await ``value`` only if it's actually awaitable.
 
@@ -286,11 +322,16 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
     if backend_name in {"MysqlBackend", "MariadbBackend"}:
         # aiomysql: ``conn.cursor()`` returns an async context manager
         # directly (no await).
+        #
+        # ``key`` is a RESERVED WORD in MySQL/MariaDB and the unquoted
+        # SELECT that previously lived here failed with ``1064 You have
+        # an error in your SQL syntax`` on those backends, which the
+        # caller mapped to a generic 503. Build the dialect-correct
+        # SQL via _mysql_lock_sql() so the identifier is backtick-
+        # quoted on MySQL/MariaDB specifically.
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "SELECT key FROM state "
-                "WHERE owner_id = %s AND namespace = %s AND key = %s "
-                "AND deleted_at IS NULL FOR UPDATE",
+                _mysql_lock_sql(),
                 (_QUOTA_OWNER_ID, _QUOTA_NAMESPACE, principal_key),
             )
             await cursor.fetchone()

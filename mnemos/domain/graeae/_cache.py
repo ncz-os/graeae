@@ -6,13 +6,24 @@ this is an acceptable tradeoff: cache warmup is fast since LLM round-trips
 are the bottleneck, and avoiding shared-state complexity is worth it.
 
 Key design choices:
-- Exact-match on normalized prompt (lowercased, stripped). Semantic/embedding
+- Exact-match on framed prompt (case-preserved). Semantic/embedding
   similarity lookup is not used here — the embedding round-trip adds latency
   comparable to skipping the cache for the less-common near-duplicate case.
 - TTL-based expiry (default 1 hour). Architectural questions don't change
   minute-to-minute; caching them avoids redundant API spend.
 - LRU eviction at max_entries and MNEMOS_GRAEAE_CACHE_MAX_BYTES (32 MiB by
   default) to bound memory usage by both entry count and serialized size.
+
+v4.4.0 (F10, 2026-09-14): ``_key`` previously lowercased the prompt,
+which silently collided distinct requests whose only difference was
+letter-case (``"Return A"`` vs ``"Return a"``). The textual cache key
+is now a deterministic SHA-256 over the EXACT framed content the caller
+passed in — case-preserved, whitespace-trimmed at the edges only.
+Two callers asking for ``"Return A"`` and ``"Return a"`` now correctly
+get two independent cache entries; their textual similarity is high
+enough that the consensus layer would have considered them
+"the same answer", but semantically they are distinct requests and
+must not return each other's cached response.
 """
 
 from __future__ import annotations
@@ -67,7 +78,16 @@ class ResponseCache:
         self._misses = 0
 
     def _key(self, prompt: str, task_type: str, model: str = "") -> str:
-        normalized = f"{task_type}:{model}:{prompt.strip().lower()}"
+        # F10 (2026-09-14): the prompt is hashed case-PRESERVED so distinct
+        # requests like "Return A" vs "Return a" no longer collide.
+        # Strip only leading/trailing whitespace (not lower()), otherwise
+        # callers asking for the same exact text still miss the cache.
+        #
+        # task_type, model, and any other response-affecting call-site
+        # setting are included exactly as supplied by the caller. The
+        # cache contract is "same key → same response", so all inputs
+        # that could change the response must contribute to the key.
+        normalized = f"{task_type}\x1f{model}\x1f{prompt.strip()}"
         return hashlib.sha256(normalized.encode()).hexdigest()
 
     def get(self, prompt: str, task_type: str, model: str = "") -> Any | None:
@@ -158,8 +178,13 @@ class RedisResponseCache:
         self._last_error = None
 
     def _key(self, prompt: str, task_type: str, model: str = "") -> str:
+        # F10 (2026-09-14): case-preserved prompt + structural field separator
+        # so distinct requests on letter-case do not collide (matches the
+        # in-process ResponseCache._key exactly so a Redis-cached and an
+        # in-process-cached entry for the same logical request hash to the
+        # same digest).
         digest = hashlib.sha256(
-            f"{prompt.strip().lower()}:{model}:{task_type}".encode()
+            f"{task_type}\x1f{model}\x1f{prompt.strip()}".encode()
         ).hexdigest()
         return f"{self.key_prefix}{digest}"
 

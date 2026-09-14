@@ -1549,6 +1549,7 @@ class GraeaeEngine:
             "quorum_reached": quorum_result["quorum_reached"],
             "quorum_threshold": quorum,
             "similarity_pairs": quorum_result["similarity_pairs"],
+            "contradiction_pairs": quorum_result["contradiction_pairs"],
         }
 
     async def _ranked_lineup(
@@ -2564,6 +2565,21 @@ def _compute_consensus(all_responses: Dict[str, Dict]) -> Dict:
                            provider (winning muse). Empty string if
                            no provider succeeded.
       consensus_score    — the winner's final_score, or 0.0.
+
+                           v4.4.0 (F11) caveat for callers that
+                           surface this value: when the consultation
+                           was run via ``route_majority``,
+                           ``consult`` may overwrite this field with
+                           the textual-agreement score from
+                           :func:`_compute_quorum`. That overwrite is
+                           a LEXICAL/SURFACE-LEVEL measure, not a
+                           semantic one — high textual overlap does
+                           not imply high semantic agreement (see
+                           :func:`_detect_negation_contradiction`).
+                           Logs and operator dashboards MUST label
+                           this field "textual agreement" or
+                           "lexical similarity", never "consensus" or
+                           "correctness".
       winning_muse       — the provider name of the winner, or None.
       cost               — sum of per-provider KNOWN cost fields. When
                            ANY successful provider's cost is absent
@@ -2731,6 +2747,19 @@ def _debate_refinement_prompt(
 
 
 def _text_similarity(left: str, right: str) -> float:
+    """Char-level SequenceMatcher ratio on whitespace-normalized lowercased text.
+
+    F11 (2026-09-14): this score measures TEXTUAL AGREEMENT, not semantic
+    consensus. Two texts can score high while meaning the opposite — the
+    classic example is ``"the answer is safe"`` vs ``"the answer is not
+    safe"``, which SequenceMatcher rates ~0.90 because the characters
+    overlap heavily but which any human would call a contradiction. See
+    :func:`_detect_negation_contradiction` for the explicit modifier
+    callers should compose on top of this score before reporting a
+    "consensus reached" verdict. Callers that surface this value to
+    operators / logs / dashboards MUST describe it as "textual
+    agreement", not "consensus" or "correctness agreement".
+    """
     left = " ".join(left.lower().split())
     right = " ".join(right.lower().split())
     if not left or not right:
@@ -2738,7 +2767,164 @@ def _text_similarity(left: str, right: str) -> float:
     return float(SequenceMatcher(None, left, right).ratio())
 
 
+# Sentence-level content words the cheap negation-contradiction check
+# considers "potentially-shared". Common English stopwords and one-letter
+# tokens are excluded so function words don't drive a false contradiction
+# flag (e.g. "the cat is not here" vs "the cat is here" would still be
+# caught on "here", which IS a real content word, but "it is not X"
+# vs "it is X" would not be picked up on "it" / "is").
+_NEGATION_TOKENS = {"not", "n't", "never", "no", "without", "isnt", "arent", "wasnt", "werent", "dont", "doesnt", "didnt", "wont", "wouldnt", "couldnt", "shouldnt", "cant", "cannot"}
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "else", "of",
+    "to", "in", "on", "at", "by", "for", "with", "as", "is", "are",
+    "was", "were", "be", "been", "being", "it", "its", "this", "that",
+    "these", "those", "i", "you", "he", "she", "we", "they", "me",
+    "him", "her", "us", "them", "my", "your", "his", "our", "their",
+    "do", "does", "did", "doing", "have", "has", "had", "having",
+    "so", "than", "too", "very", "can", "will", "would", "could",
+    "should", "may", "might", "must", "shall", "into", "from",
+    "about", "above", "below", "between", "after", "before",
+    "over", "under", "again", "further", "once", "here", "there",
+    "when", "where", "why", "how", "all", "any", "both", "each",
+    "few", "more", "most", "other", "some", "such", "no", "nor",
+    "not", "only", "own", "same", "also",
+}
+
+
+def _detect_negation_contradiction(left: str, right: str) -> bool:
+    """Cheap heuristic: do these two texts NEGATE each other?
+
+    Returns True when:
+      * both texts are short-ish (≤ ~40 words; longer "essays" can share
+        negated phrases for emphasis and we don't want false positives),
+      * both texts contain at least one shared non-stopword content
+        word (so "safe" vs "not safe" qualifies on "safe", but two
+        unrelated negations like "not hot" / "not cold" do NOT —
+        they share no content word and the heuristic returns False),
+      * the SET of negation cues present in the two texts is not equal.
+        "not safe" vs "safe" → {"not"} vs {} → True.
+        "not safe" vs "very not safe" → {"not"} vs {"not", "very"} → False.
+
+    This is deliberately narrow: it catches the exact ``"safe"`` vs
+    ``"not safe"`` class of false-positive textual-agreement flips
+    the F11 review reproduced, without pretending to be a full
+    contradiction detector. Negation-detection in natural language is
+    an open research problem — this is a guard-rail, not a theorem.
+    """
+    if not left or not right:
+        return False
+    left_norm = " ".join(left.lower().split())
+    right_norm = " ".join(right.lower().split())
+    left_tokens = left_norm.split()
+    right_tokens = right_norm.split()
+    if not left_tokens or not right_tokens:
+        return False
+    # Bound to sentence-pair-scale phrasing; longer "essays" warrant
+    # a real NLP contradiction pipeline, not this heuristic.
+    if len(left_tokens) > 40 or len(right_tokens) > 40:
+        return False
+    # Split contractions the tokenizer left intact ("isn't" → "isn't" is
+    # one token; we already enumerate the spelled-out forms in
+    # _NEGATION_TOKENS but also strip the trailing apostrophe so
+    # ``"isn't"`` matches the entry ``"isnt"`` below).
+    def _neg_cues(tokens: list[str]) -> set[str]:
+        cues: set[str] = set()
+        for tok in tokens:
+            stripped = tok.strip(".,;:!?\"'()[]{}")
+            if not stripped:
+                continue
+            lowered = stripped.lower()
+            cue = lowered.rstrip("'")
+            if cue in _NEGATION_TOKENS:
+                cues.add(cue)
+                continue
+            # "n't" is part of contractions; check suffix only on the
+            # *raw* token so we don't accidentally match "isn't" twice.
+            if lowered.endswith("n't") and "n't" in _NEGATION_TOKENS:
+                cues.add("n't")
+        return cues
+
+    left_cues = _neg_cues(left_tokens)
+    right_cues = _neg_cues(right_tokens)
+
+    def _content_words(tokens: list[str]) -> set[str]:
+        words: set[str] = set()
+        for tok in tokens:
+            w = tok.strip(".,;:!?\"'()[]{}").lower()
+            if len(w) < 3 or w in _STOPWORDS or w in _NEGATION_TOKENS:
+                continue
+            words.add(w)
+        return words
+
+    left_content = _content_words(left_tokens)
+    right_content = _content_words(right_tokens)
+    shared = left_content & right_content
+    if not shared:
+        return False
+    # Cue sets differ → one side asserts, the other denies, on shared
+    # content. Same cue set (both negated, or both un-negated) is fine.
+    return bool(left_cues ^ right_cues)
+
+
+def _textual_agreement(left: str, right: str) -> float:
+    """Composite score: textual similarity reduced when the texts contradict.
+
+    Returns ``_text_similarity(left, right)`` unchanged unless
+    :func:`_detect_negation_contradiction` flags the pair, in which case
+    the score is floored to a small value so it cannot count toward a
+    quorum / high-agreement verdict. ``0.05`` was chosen so that even
+    a 2/3 majority with all-muses-positive-but-one-muse-negating
+    produces per-pair scores that never reach the default ``0.66``
+    quorum threshold — i.e. negation-contradicted pairs cannot
+    silently inflate quorum_reached.
+    """
+    base = _text_similarity(left, right)
+    if _detect_negation_contradiction(left, right):
+        return min(base, 0.05)
+    return base
+
+
 def _compute_quorum(all_responses: Dict[str, Dict], quorum: float) -> Dict[str, Any]:
+    """Compute textual-agreement quorum across successful provider responses.
+
+    F11 (2026-09-14) — IMPORTANT — this function does NOT measure
+    semantic consensus. ``_text_similarity`` is a character-level
+    SequenceMatcher ratio on whitespace-normalized lower-cased text;
+    two texts can score high while meaning the opposite. The composite
+    :func:`_textual_agreement` reduces the per-pair score to a floor of
+    ``0.05`` when :func:`_detect_negation_contradiction` flags the pair,
+    so negation-contradicted pairs cannot inflate ``quorum_reached``.
+
+    Field semantics:
+      * ``quorum_reached``     — True iff the largest textual-agreement
+                                 component has at least ``quorum`` muses.
+      * ``quorum_muses``       — the names of the muses in that component
+                                 (empty list when ``quorum_reached`` is False).
+      * ``consensus_score``    — surfaced as ``consensus_score`` on the
+                                 wire (v3.0 public contract — DO NOT
+                                 rename without a schema bump); it is
+                                 the textual-agreement score of the
+                                 quorum component. CALLERS MUST treat
+                                 this as "textual agreement", NOT as
+                                 "semantic consensus" or "correctness
+                                 agreement". A high ``consensus_score``
+                                 with all-muses-actually-disagreeing
+                                 answers is the kind of bug a real
+                                 NLP-driven consensus layer would catch;
+                                 this lexical scorer cannot.
+      * ``similarity_pairs``   — the per-pair textual similarity scores.
+      * ``contradiction_pairs``— NEW in v4.4.0 (F11): a map keyed
+                                 ``"left:right"`` containing those
+                                 pairs whose negation-contradiction
+                                 heuristic fired (value True). Lets
+                                 operators audit whether the
+                                 textual-agreement floor actually
+                                 mattered for a given response.
+
+    Availability-weighted consensus ("how many providers responded")
+    is a SEPARATE concept from this textual-agreement score; this
+    function is not a calibrated correctness vote.
+    """
     successes = {
         name: str(resp.get("response_text") or "").strip()
         for name, resp in all_responses.items()
@@ -2751,6 +2937,7 @@ def _compute_quorum(all_responses: Dict[str, Dict], quorum: float) -> Dict[str, 
             "quorum_muses": [],
             "consensus_score": 0.0,
             "similarity_pairs": {},
+            "contradiction_pairs": {},
         }
 
     parent = {name: name for name in successes}
@@ -2768,13 +2955,21 @@ def _compute_quorum(all_responses: Dict[str, Dict], quorum: float) -> Dict[str, 
             parent[right_root] = left_root
 
     similarity_pairs: dict[str, float] = {}
+    contradiction_pairs: dict[str, bool] = {}
     best_score = 0.0
     for left, right in combinations(successes, 2):
-        score = _text_similarity(successes[left], successes[right])
+        score = _textual_agreement(successes[left], successes[right])
         similarity_pairs[f"{left}:{right}"] = round(score, 4)
         best_score = max(best_score, score)
         if score >= quorum:
             union(left, right)
+        # Surface the negation-contradiction flag for operator audit
+        # regardless of whether the pair joined a quorum component.
+        if _detect_negation_contradiction(successes[left], successes[right]):
+            contradiction_pairs[f"{left}:{right}"] = True
+            # Also flag in the reverse-key direction so a caller
+            # looking up the pair by either ordering finds it.
+            contradiction_pairs[f"{right}:{left}"] = True
 
     components: dict[str, list[str]] = {}
     for name in successes:
@@ -2799,6 +2994,7 @@ def _compute_quorum(all_responses: Dict[str, Dict], quorum: float) -> Dict[str, 
         "quorum_muses": quorum_muses if quorum_reached else [],
         "consensus_score": round(float(consensus_score), 4),
         "similarity_pairs": similarity_pairs,
+        "contradiction_pairs": contradiction_pairs,
     }
 
 
