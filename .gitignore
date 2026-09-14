@@ -26,3 +26,6 @@ venv/
 uv.lock
 zoder_run.log
 .zoder_task_*.md
+# One-off task description file dropped by the harness on each task;
+# not a project artifact.
+TASK_P2_GRAEAE.md
