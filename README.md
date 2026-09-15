@@ -117,3 +117,15 @@ agreement between their endpoints. Matching templates with different numeric
 values and certain short negation pairs are rejected. These guards do not detect
 all contradictions. `agreement_metric=lexical_complete_link` and
 `contradiction_pairs` expose the method and observed guards.
+
+
+### Live quota concurrency validation
+
+`tests/test_quota_live.py` checks first-use admission from eight concurrent
+requests against an empty principal with a one-unit quota. It requires a
+dedicated test schema/database, `MNEMOS_TEST_ALLOW_RESET=1`, and either
+`MNEMOS_TEST_ORACLE_DSN` or `MNEMOS_TEST_DB2_DSN`; it deletes only its random quota
+key afterward. Oracle needs the `oracledb` driver and Db2 needs `ibm_db`.
+The runtime creates the quota row before locking: Oracle does not gap-lock
+missing rows. Native Db2 uses positional binds and retains the update lock.
+Duplicate-key races alone are tolerated; database fetch failures deny admission.

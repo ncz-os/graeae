@@ -255,13 +255,7 @@ async def test_lock_quota_row_for_update_oracle_db2_uses_bind_params(
     monkeypatch: pytest.MonkeyPatch,
     backend_name: str,
 ):
-    """Oracle/Db2 branch uses named bind params (``owner_id``, ``namespace``,
-    ``key``). The bare ``SELECT key FROM state`` is correct on those
-    backends because the ``key`` literal is a SQL identifier on Oracle
-    (not reserved) and a column reference on Db2 (also not reserved in
-    SELECT/WHERE contexts — Db2's reserved-word rule applies to DDL, not
-    to plain SELECT against a real column named ``key``). This test pins
-    the dialect-correct shape across all three Oracle/Db2 backends."""
+    """Oracle uses named binds; native Db2 requires positional binds."""
 
     executed: list[tuple[str, dict]] = []
 
@@ -286,31 +280,25 @@ async def test_lock_quota_row_for_update_oracle_db2_uses_bind_params(
 
     await consultations._lock_quota_row_for_update(tx, "principal-oracle")
 
-    assert len(executed) == 1, (
-        f"{backend_name} branch expected exactly 1 execute call, got "
-        f"{executed!r}"
-    )
-    sql, params = executed[0]
-    assert sql.startswith("SELECT"), (
-        f"{backend_name} lock SQL must start with SELECT — got: {sql!r}"
-    )
+    assert len(executed) == 2
+    sql, params = executed[-1]
+    assert sql.startswith("SELECT")
     assert "FROM state" in sql
     assert "FOR UPDATE" in sql.upper()
-    # The Oracle/DB2 form uses named bind params (``:key`` etc.), NOT
-    # backticks (`` `key` ``) and NOT positional ``%s``.
-    assert ":owner_id" in sql
-    assert ":namespace" in sql
-    assert ":key" in sql
-    assert "`" not in sql, (
-        f"{backend_name} branch must not use MySQL backticks — got: {sql!r}"
-    )
-    assert "%s" not in sql, (
-        f"{backend_name} branch uses named params, not %s — got: {sql!r}"
-    )
-    assert isinstance(params, dict)
-    assert params["owner_id"] == consultations._QUOTA_OWNER_ID
-    assert params["namespace"] == consultations._QUOTA_NAMESPACE
-    assert params["key"] == "principal-oracle"
+    assert "`" not in sql
+    assert "%s" not in sql
+    if backend_name == "OracleBackend":
+        assert "DUP_VAL_ON_INDEX" in executed[0][0]
+        assert ":owner_id" in sql and ":namespace" in sql and ":key" in sql
+        assert params == dict(
+            owner_id=consultations._QUOTA_OWNER_ID,
+            namespace=consultations._QUOTA_NAMESPACE,
+            key="principal-oracle",
+        )
+    else:
+        assert executed[0][0].startswith("INSERT INTO state")
+        assert sql.count("?") == 3
+        assert params == (consultations._QUOTA_OWNER_ID, consultations._QUOTA_NAMESPACE, "principal-oracle")
 
 
 @pytest.mark.asyncio

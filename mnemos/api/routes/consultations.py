@@ -263,11 +263,9 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
       * Sqlite: ``BEGIN IMMEDIATE`` already holds a RESERVED write lock
         on the only writer connection; no extra statement needed.
 
-    Best-effort: any backend where we cannot raise a lock (e.g. an
-    unsupported driver surface) falls back to a bare ``state_kv.get()``
-    via the rest of the function — that path is no worse than the legacy
-    in-memory fallback the old code shipped, but the operator sees a
-    warning log instead of a 5xx.
+    Lock/driver errors propagate to fail-closed admission. Oracle creates
+    the first quota row before locking; SELECT FOR UPDATE alone cannot
+    serialize requests when that row does not yet exist.
     """
     backend = _lc._persistence_backend
     backend_name = type(backend).__name__ if backend is not None else ""
@@ -284,7 +282,32 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
         )
         return
 
-    if backend_name in {"OracleBackend", "Db2Backend", "Db2BackendNative"}:
+    if backend_name in {"Db2Backend", "Db2BackendNative"}:
+        cursor = conn.cursor()
+        params = (_QUOTA_OWNER_ID, _QUOTA_NAMESPACE, principal_key)
+        try:
+            from mnemos.persistence.oracle import _is_unique_violation
+
+            try:
+                await cursor.execute(
+                    "INSERT INTO state (owner_id, namespace, key, value) "
+                    "VALUES (?, ?, ?, '[]')",
+                    params,
+                )
+            except Exception as exc:  # noqa: BLE001 - only duplicate rows are expected
+                if not _is_unique_violation(exc):
+                    raise
+            await cursor.execute(
+                "SELECT key FROM state WHERE owner_id = ? "
+                "AND namespace = ? AND key = ? FOR UPDATE WITH RS",
+                params,
+            )
+            await cursor.fetchone()
+        finally:
+            await _maybe_await(cursor.close())
+        return
+
+    if backend_name == "OracleBackend":
         # cursor() is synchronous on both python-oracledb's async
         # connection and this repo's own Db2BackendNative wrapper
         # (mnemos/persistence/db2.py::_Db2NativeAsyncConnection.cursor) --
@@ -294,29 +317,32 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
         # 503 in production (2026-09-14).
         cursor = conn.cursor()
         try:
+            # Oracle does not gap-lock a missing row. Insert first and
+            # ignore only the expected unique-key race; the winner's
+            # transaction must finish before the loser can lock/read it.
             await cursor.execute(
-                "SELECT key FROM state "
-                "WHERE owner_id = :owner_id AND namespace = :namespace "
-                "AND key = :key AND deleted_at IS NULL FOR UPDATE",
+                "BEGIN INSERT INTO state (owner_id, namespace, key, value) "
+                "VALUES (:owner_id, :namespace, :key, '[]'); "
+                "EXCEPTION WHEN DUP_VAL_ON_INDEX THEN NULL; END;",
                 {
                     "owner_id": _QUOTA_OWNER_ID,
                     "namespace": _QUOTA_NAMESPACE,
                     "key": principal_key,
                 },
             )
-            # Drain the cursor so the FOR UPDATE row lock is actually
-            # held by the open transaction (Oracle is non-autocommitting
-            # and won't acquire the lock until the row is read). The
-            # fetch itself can legitimately return nothing if the row
-            # doesn't exist yet — Oracle still locks the gap.
-            try:
-                await cursor.fetchone()
-            except Exception as drain_exc:  # noqa: BLE001
-                logger.debug(
-                    "quota row-lock drain returned no row for principal=%s: %s",
-                    principal_key[:12],
-                    drain_exc,
-                )
+            await cursor.execute(
+                "SELECT key FROM state "
+                "WHERE owner_id = :owner_id AND namespace = :namespace "
+                "AND key = :key FOR UPDATE",
+                {
+                    "owner_id": _QUOTA_OWNER_ID,
+                    "namespace": _QUOTA_NAMESPACE,
+                    "key": principal_key,
+                },
+            )
+            # Fetch failures must abort admission; they are not evidence of
+            # an empty row and must not silently bypass quota serialization.
+            await cursor.fetchone()
         finally:
             await _maybe_await(cursor.close())
         return
