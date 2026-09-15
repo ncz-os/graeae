@@ -628,3 +628,18 @@ async def test_enforce_consult_quota_succeeds_against_real_oracle_cursor_shape(
 
     await consultations._enforce_consult_quota("oracle-user-2@example.com", "auto")
     assert conn.cursor_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend_name", ["OracleBackend", "Db2BackendNative"])
+async def test_quota_lock_fetch_failure_propagates(monkeypatch, backend_name):
+    class Cursor(_FakeRealOracleCursor):
+        async def fetchone(self):
+            raise RuntimeError("database read failed")
+
+    cursor = Cursor()
+    conn = SimpleNamespace(cursor=lambda: cursor)
+    monkeypatch.setattr(consultations._lc, "_persistence_backend", type(backend_name, (), {})())
+    with pytest.raises(RuntimeError, match="database read failed"):
+        await consultations._lock_quota_row_for_update(SimpleNamespace(conn=conn), "failure-test")
+    assert cursor.closed

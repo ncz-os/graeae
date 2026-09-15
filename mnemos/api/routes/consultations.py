@@ -8,28 +8,26 @@ import hashlib
 import hmac
 import inspect
 import json
-
-from mnemos.core import audit_chain
 import logging
 import os
 import time
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-
 import mnemos.core.lifecycle as _lc
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import backend_or_503, require_consultations_backend
+from mnemos.core import audit_chain
 from mnemos.core.rate_limit import limiter
 from mnemos.core.security import is_root, scope_namespace
 from mnemos.domain.graeae.engine import _REGISTRY_MAP
 from mnemos.domain.models import (
+    SUPPORTED_CONSULTATION_MODES,
     AuditLogEntry,
     AuditVerifyResponse,
     ConsultationArtifact,
     ConsultationRequest,
     ConsultationResponse,
-    SUPPORTED_CONSULTATION_MODES,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,7 +180,9 @@ def _advisory_lock_key(principal_key: str) -> int:
     take the first 8 bytes of the SHA-256 digest of a namespaced string,
     reinterpret as signed int64 so pg_advisory_xact_lock accepts it.
     """
-    digest = hashlib.sha256(f"graeae-consult-quota:{principal_key}".encode()).digest()[:8]
+    digest = hashlib.sha256(f"graeae-consult-quota:{principal_key}".encode()).digest()[
+        :8
+    ]
     key = int.from_bytes(digest, "big", signed=False)
     if key >= 2**63:
         key -= 2**64
@@ -263,11 +263,9 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
       * Sqlite: ``BEGIN IMMEDIATE`` already holds a RESERVED write lock
         on the only writer connection; no extra statement needed.
 
-    Best-effort: any backend where we cannot raise a lock (e.g. an
-    unsupported driver surface) falls back to a bare ``state_kv.get()``
-    via the rest of the function — that path is no worse than the legacy
-    in-memory fallback the old code shipped, but the operator sees a
-    warning log instead of a 5xx.
+    Lock/driver errors propagate to fail-closed admission. Oracle creates
+    the first quota row before locking; SELECT FOR UPDATE alone cannot
+    serialize requests when that row does not yet exist.
     """
     backend = _lc._persistence_backend
     backend_name = type(backend).__name__ if backend is not None else ""
@@ -279,10 +277,37 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
         # asyncpg: ``conn.execute`` with a bind parameter, no commit
         # needed — pg_advisory_xact_lock is tx-scoped. Same template as
         # the audit-chain advisory lock earlier in this file.
-        await conn.execute("SELECT pg_advisory_xact_lock($1)", _advisory_lock_key(principal_key))
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock($1)", _advisory_lock_key(principal_key)
+        )
         return
 
-    if backend_name in {"OracleBackend", "Db2Backend", "Db2BackendNative"}:
+    if backend_name in {"Db2Backend", "Db2BackendNative"}:
+        cursor = conn.cursor()
+        params = (_QUOTA_OWNER_ID, _QUOTA_NAMESPACE, principal_key)
+        try:
+            from mnemos.persistence.oracle import _is_unique_violation
+
+            try:
+                await cursor.execute(
+                    "INSERT INTO state (owner_id, namespace, key, value) "
+                    "VALUES (?, ?, ?, '[]')",
+                    params,
+                )
+            except Exception as exc:  # noqa: BLE001 - only duplicate rows are expected
+                if not _is_unique_violation(exc):
+                    raise
+            await cursor.execute(
+                "SELECT key FROM state WHERE owner_id = ? "
+                "AND namespace = ? AND key = ? FOR UPDATE WITH RS",
+                params,
+            )
+            await cursor.fetchone()
+        finally:
+            await _maybe_await(cursor.close())
+        return
+
+    if backend_name == "OracleBackend":
         # cursor() is synchronous on both python-oracledb's async
         # connection and this repo's own Db2BackendNative wrapper
         # (mnemos/persistence/db2.py::_Db2NativeAsyncConnection.cursor) --
@@ -292,29 +317,32 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
         # 503 in production (2026-09-14).
         cursor = conn.cursor()
         try:
+            # Oracle does not gap-lock a missing row. Insert first and
+            # ignore only the expected unique-key race; the winner's
+            # transaction must finish before the loser can lock/read it.
             await cursor.execute(
-                "SELECT key FROM state "
-                "WHERE owner_id = :owner_id AND namespace = :namespace "
-                "AND key = :key AND deleted_at IS NULL FOR UPDATE",
+                "BEGIN INSERT INTO state (owner_id, namespace, key, value) "
+                "VALUES (:owner_id, :namespace, :key, '[]'); "
+                "EXCEPTION WHEN DUP_VAL_ON_INDEX THEN NULL; END;",
                 {
                     "owner_id": _QUOTA_OWNER_ID,
                     "namespace": _QUOTA_NAMESPACE,
                     "key": principal_key,
                 },
             )
-            # Drain the cursor so the FOR UPDATE row lock is actually
-            # held by the open transaction (Oracle is non-autocommitting
-            # and won't acquire the lock until the row is read). The
-            # fetch itself can legitimately return nothing if the row
-            # doesn't exist yet — Oracle still locks the gap.
-            try:
-                await cursor.fetchone()
-            except Exception as drain_exc:  # noqa: BLE001
-                logger.debug(
-                    "quota row-lock drain returned no row for principal=%s: %s",
-                    principal_key[:12],
-                    drain_exc,
-                )
+            await cursor.execute(
+                "SELECT key FROM state "
+                "WHERE owner_id = :owner_id AND namespace = :namespace "
+                "AND key = :key FOR UPDATE",
+                {
+                    "owner_id": _QUOTA_OWNER_ID,
+                    "namespace": _QUOTA_NAMESPACE,
+                    "key": principal_key,
+                },
+            )
+            # Fetch failures must abort admission; they are not evidence of
+            # an empty row and must not silently bypass quota serialization.
+            await cursor.fetchone()
         finally:
             await _maybe_await(cursor.close())
         return
@@ -330,6 +358,13 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
         # SQL via _mysql_lock_sql() so the identifier is backtick-
         # quoted on MySQL/MariaDB specifically.
         async with conn.cursor() as cursor:
+            # Create/lock the row before a gap-locking SELECT can deadlock
+            # competing first-use inserts. A duplicate is an unchanged row.
+            await cursor.execute(
+                "INSERT INTO state (`owner_id`, `namespace`, `key`, value) "
+                "VALUES (%s, %s, %s, '[]') ON DUPLICATE KEY UPDATE `key` = `key`",
+                (_QUOTA_OWNER_ID, _QUOTA_NAMESPACE, principal_key),
+            )
             await cursor.execute(
                 _mysql_lock_sql(),
                 (_QUOTA_OWNER_ID, _QUOTA_NAMESPACE, principal_key),
@@ -341,7 +376,9 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
     # serialization is already in effect. No extra statement needed.
 
 
-def _prune_quota_entries(entries: list[dict[str, Any]], *, now_ms: int) -> list[dict[str, Any]]:
+def _prune_quota_entries(
+    entries: list[dict[str, Any]], *, now_ms: int
+) -> list[dict[str, Any]]:
     """Drop entries older than the sliding window and bound total size."""
     cutoff = now_ms - int(_QUOTA_WINDOW_SECONDS * 1000)
     pruned = [entry for entry in entries if int(entry.get("ts_ms", 0)) > cutoff]
@@ -411,7 +448,11 @@ async def _enforce_consult_quota(user_id: str, mode: str) -> None:
                     oldest_ts_ms = int(entries[0].get("ts_ms", now_ms))
                     retry = max(
                         1,
-                        ((oldest_ts_ms + int(_QUOTA_WINDOW_SECONDS * 1000) - now_ms) + 999) // 1000,
+                        (
+                            (oldest_ts_ms + int(_QUOTA_WINDOW_SECONDS * 1000) - now_ms)
+                            + 999
+                        )
+                        // 1000,
                     )
                 else:
                     retry = 1
@@ -468,7 +509,9 @@ _VALID_TIERS = {"frontier", "premium", "budget"}
 # filter doesn't silently drop entries. Only `anthropic→claude` flips
 # today but the map is built from _REGISTRY_MAP so future renames
 # propagate automatically.
-_REGISTRY_TO_GRAEAE = {cfg["registry_provider"]: name for name, cfg in _REGISTRY_MAP.items()}
+_REGISTRY_TO_GRAEAE = {
+    cfg["registry_provider"]: name for name, cfg in _REGISTRY_MAP.items()
+}
 
 
 def _to_graeae_provider(registry_name: str) -> str:
@@ -492,7 +535,7 @@ async def _tier_lineup(tier: str) -> dict:
     if tier not in _VALID_TIERS:
         raise HTTPException(
             status_code=400,
-            detail=(f"unknown tier {tier!r}; " f"expected one of {sorted(_VALID_TIERS)}"),
+            detail=(f"unknown tier {tier!r}; expected one of {sorted(_VALID_TIERS)}"),
         )
     backend = require_consultations_backend()
     async with backend.transactional() as tx:
@@ -553,7 +596,10 @@ async def _resolve_selection(
     if len(set_fields) > 1:
         raise HTTPException(
             status_code=400,
-            detail=(f"Custom Query accepts at most one of " f"{{'models', 'providers', 'tier'}}; got {set_fields}"),
+            detail=(
+                f"Custom Query accepts at most one of "
+                f"{{'models', 'providers', 'tier'}}; got {set_fields}"
+            ),
         )
 
     if models:
@@ -699,7 +745,12 @@ async def _write_memory_refs_on_conn(
 
 def _extract_memory_ids(result: dict) -> List[str]:
     """Collect injected/reference memory IDs from known result shapes."""
-    raw_ids = result.get("memory_ids") or result.get("injected_memory_ids") or result.get("citations") or []
+    raw_ids = (
+        result.get("memory_ids")
+        or result.get("injected_memory_ids")
+        or result.get("citations")
+        or []
+    )
     memory_ids: list[str] = []
     for raw_id in raw_ids:
         memory_id = str(raw_id).strip()
@@ -726,14 +777,19 @@ def _require_non_empty_consultation_result(result: object, mode: str) -> dict:
 
 @router.post("/consultations", response_model=ConsultationResponse)
 @limiter.limit("60/minute")
-async def consult_graeae(request: Request, body: ConsultationRequest, user: UserContext = Depends(get_current_user)):
+async def consult_graeae(
+    request: Request,
+    body: ConsultationRequest,
+    user: UserContext = Depends(get_current_user),
+):
     """Consult GRAEAE multi-provider consensus engine.
 
     Creates a hash-chained audit entry and records any injected memories.
     Returns raw provider responses (full, best, or truncated per format param).
     """
     logger.info(
-        f"[CONSULTATION] {user.user_id}: {body.task_type} " f"(limit_chars={body.limit_chars}, format={body.format})"
+        f"[CONSULTATION] {user.user_id}: {body.task_type} "
+        f"(limit_chars={body.limit_chars}, format={body.format})"
     )
     # SECURITY (review #12): cost-weighted per-principal quota, BEFORE any
     # provider fan-out, so a single caller cannot turn 60 req/min of
@@ -811,7 +867,9 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             consensus_response = result.get("consensus_response", "") or ""
             consensus_score = float(result.get("consensus_score", 0.0) or 0.0)
             winning_muse = result.get("winning_muse")
-            engine_cost = float(result.get("cost", 0.0) or 0.0)
+            engine_cost = (
+                float(result["cost"]) if result.get("cost") is not None else None
+            )
             engine_latency_ms = int(result.get("latency_ms", 0) or 0)
 
             # All three writes — consultation row, audit entry, memory refs —
@@ -820,30 +878,32 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             # committed consultation implies a committed audit chain link.
             try:
                 async with backend.transactional() as tx:
-                    consultation_id = await backend.consultations.create_consultation_with_audit(
-                        tx,
-                        prompt=body.prompt,
-                        task_type=body.task_type,
-                        consensus_response=consensus_response,
-                        consensus_score=consensus_score,
-                        winning_muse=winning_muse,
-                        cost=engine_cost,
-                        latency_ms=engine_latency_ms,
-                        mode=body.mode,
-                        owner_id=user.user_id,
-                        namespace=user.namespace,
-                        memory_ids=memory_ids,
-                        # SECURITY (review #10): keyed genesis. NOTE: mnemos-core's
-                        # create_consultation_with_audit must adopt
-                        # compute_audit_chain_hash for the per-link MAC too, else
-                        # verify() below will (correctly) report the chain unsigned.
-                        genesis_hash=genesis_hash,
-                        # Core signs each link with the same key the verifier
-                        # below uses. Without this the writer fell back to an
-                        # unkeyed 3-field SHA-256 and verify() reported the
-                        # chain unsigned -- the failure the comment above
-                        # predicted.
-                        audit_key=_audit_hmac_key(),
+                    consultation_id = (
+                        await backend.consultations.create_consultation_with_audit(
+                            tx,
+                            prompt=body.prompt,
+                            task_type=body.task_type,
+                            consensus_response=consensus_response,
+                            consensus_score=consensus_score,
+                            winning_muse=winning_muse,
+                            cost=engine_cost,
+                            latency_ms=engine_latency_ms,
+                            mode=body.mode,
+                            owner_id=user.user_id,
+                            namespace=user.namespace,
+                            memory_ids=memory_ids,
+                            # SECURITY (review #10): keyed genesis. NOTE: mnemos-core's
+                            # create_consultation_with_audit must adopt
+                            # compute_audit_chain_hash for the per-link MAC too, else
+                            # verify() below will (correctly) report the chain unsigned.
+                            genesis_hash=genesis_hash,
+                            # Core signs each link with the same key the verifier
+                            # below uses. Without this the writer fell back to an
+                            # unkeyed 3-field SHA-256 and verify() reported the
+                            # chain unsigned -- the failure the comment above
+                            # predicted.
+                            audit_key=_audit_hmac_key(),
+                        )
                     )
                     if getattr(backend, "supports_webhooks", True):
                         delivery_ids = await backend.webhooks.dispatch_event(
@@ -865,7 +925,9 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             except HTTPException:
                 raise
             except Exception as e:
-                logger.error(f"[CONSULTATION] persist failed — aborting: {e}", exc_info=True)
+                logger.error(
+                    f"[CONSULTATION] persist failed — aborting: {e}", exc_info=True
+                )
                 raise HTTPException(
                     status_code=503,
                     detail="Consultation persistence failed; audit trail is required.",
@@ -895,7 +957,9 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         return ConsultationResponse(
             # asyncpg returns UUID columns as uuid.UUID objects, not strings.
             # ConsultationResponse.consultation_id is typed str, so coerce.
-            consultation_id=str(consultation_id) if consultation_id is not None else None,
+            consultation_id=str(consultation_id)
+            if consultation_id is not None
+            else None,
             all_responses=result.get("all_responses", {}),
             consensus_response=result.get("consensus_response"),
             consensus_score=result.get("consensus_score"),
@@ -909,13 +973,17 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             quorum_reached=result.get("quorum_reached"),
             quorum_threshold=result.get("quorum_threshold"),
             similarity_pairs=result.get("similarity_pairs"),
+            contradiction_pairs=result.get("contradiction_pairs"),
+            agreement_metric=result.get("agreement_metric"),
         )
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"[CONSULTATION] Error: {e}", exc_info=True)
-        raise HTTPException(status_code=503, detail="Consultation failed — see server logs for details")
+        raise HTTPException(
+            status_code=503, detail="Consultation failed — see server logs for details"
+        )
 
 
 # ── Audit log endpoints (declared before dynamic /{consultation_id} to prevent
@@ -996,7 +1064,11 @@ async def verify_audit_chain(
         return AuditVerifyResponse(
             valid=True,
             entries_checked=0,
-            message=("Audit log is empty" if verify_global_chain else "No audit entries visible for caller"),
+            message=(
+                "Audit log is empty"
+                if verify_global_chain
+                else "No audit entries visible for caller"
+            ),
         )
 
     if verify_global_chain:
@@ -1033,7 +1105,9 @@ async def verify_audit_chain(
             first_broken_sequence = entries_failed[0]
             message = failures[first_broken_sequence]
             if len(entries_failed) > 1:
-                message = f"{message}; {len(entries_failed)} entries failed verification"
+                message = (
+                    f"{message}; {len(entries_failed)} entries failed verification"
+                )
             return AuditVerifyResponse(
                 valid=False,
                 entries_checked=len(rows),
@@ -1098,7 +1172,9 @@ async def verify_audit_chain(
         first_broken_sequence = entries_failed[0]
         message = failures[first_broken_sequence]
         if len(entries_failed) > 1:
-            message = f"{message}; {len(entries_failed)} scoped entries failed verification"
+            message = (
+                f"{message}; {len(entries_failed)} scoped entries failed verification"
+            )
         return AuditVerifyResponse(
             valid=False,
             entries_checked=len(rows),
@@ -1230,7 +1306,9 @@ async def get_consultation(
         "cost": row["cost"],
         "latency_ms": row["latency_ms"],
         "mode": row["mode"],
-        "created_at": row["created"].isoformat() if hasattr(row["created"], "isoformat") else str(row["created"]),
+        "created_at": row["created"].isoformat()
+        if hasattr(row["created"], "isoformat")
+        else str(row["created"]),
     }
 
 
@@ -1245,7 +1323,10 @@ async def get_consultation_artifacts(
     root = is_root(user)
     backend = require_consultations_backend()
     async with backend.transactional() as tx:
-        consultation, memory_refs = await backend.consultations.get_consultation_artifacts(
+        (
+            consultation,
+            memory_refs,
+        ) = await backend.consultations.get_consultation_artifacts(
             tx,
             consultation_id=consultation_id,
             root=root,
@@ -1278,7 +1359,11 @@ async def get_consultation_artifacts(
 # graeae_get_consultation MCP tool share identical semantics.
 from mnemos.domain.consultation_recall import (  # noqa: E402
     VALID_FULL_SECTIONS as _VALID_FULL_SECTIONS,
+)
+from mnemos.domain.consultation_recall import (  # noqa: E402
     paginate_full_parts as _paginate_full_parts,
+)
+from mnemos.domain.consultation_recall import (  # noqa: E402
     select_full_parts as _select_full_parts,
 )
 
@@ -1288,7 +1373,9 @@ from mnemos.domain.consultation_recall import (  # noqa: E402
 async def get_consultation_full(
     request: Request,
     consultation_id: str,
-    section: str = Query("all", description="all | source | quorum | synthesis | muses"),
+    section: str = Query(
+        "all", description="all | source | quorum | synthesis | muses"
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(6000, ge=500, le=50000),
     namespace: Optional[str] = Query(None),
@@ -1301,7 +1388,9 @@ async def get_consultation_full(
     a caller can walk the full untruncated result.
     """
     if section not in _VALID_FULL_SECTIONS:
-        raise HTTPException(status_code=422, detail=f"section must be one of {_VALID_FULL_SECTIONS}")
+        raise HTTPException(
+            status_code=422, detail=f"section must be one of {_VALID_FULL_SECTIONS}"
+        )
     root = is_root(user)
     target_ns = scope_namespace(user, namespace)
     backend = require_consultations_backend()

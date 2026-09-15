@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import pytest
-
 from mnemos.domain.graeae.engine import GraeaeEngine
 from mnemos.domain.graeae.provider_worker import ProviderQueryResponse
-
 
 pytestmark = pytest.mark.asyncio
 
@@ -28,6 +26,7 @@ async def test_provider_worker_params_are_bounded_before_dispatch(monkeypatch):
         )
 
     engine.provider_worker = worker
+    engine.providers = {"openai": {"model": "model-a"}}
 
     await engine._call_provider_worker(
         "openai",

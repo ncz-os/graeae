@@ -1,4 +1,4 @@
-# GitLab CI — Python "real errors" gate (ruff, high-signal rules only).
+# GitLab CI — high-signal lint and executable regression suites.
 # GitLab SaaS shared runners (free OSS minutes), no fleet CPU. Catches syntax
 # errors + undefined names (E9,F63,F7,F82); stylistic/style-of-imports rules
 # (E402/E501, unused imports) are intentionally NOT gated here — tighten per repo
@@ -21,25 +21,14 @@ pytest:
   stage: check
   image: python:3.13-slim
   before_script:
-    # This distribution is a PEP 420 namespace layer on mnemos-core. CI checks
-    # out core beside it and installs both editably, matching split-repository
-    # development while exercising the same declared dependency consumers use.
-    #
-    # build-essential + cmake: mnemos-core depends on llama-cpp-python, which
-    # is the one dependency in the closure that compiles from source when no
-    # prebuilt wheel matches the runner's platform/Python ABI (python:3.12-slim
-    # here). This job ran on a prebuilt wheel for months; it broke the first
-    # day pip had to fall back to a source build, with
-    # "CMake Error: Could not find the compiler specified in CC: gcc" --
-    # a missing-toolchain gap, not a real test failure. Installing the
-    # toolchain unconditionally makes this job robust to wheel availability
-    # either way, matching Dockerfile.core's own documented expectation that
-    # this dependency may need to compile.
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git build-essential cmake
-    - git clone --depth 1 https://gitlab.com/ncz-os/mnemos.git ../mnemos-core
-    - python -m pip install --quiet -e ../mnemos-core -e ".[test]"
+    - git clone https://gitlab.com/ncz-os/mnemos.git ../mnemos-core
+    - git -C ../mnemos-core checkout 811a2bc2f33d80ca0c2ca9b6fd5696bd681d86b1
+    - git clone https://gitlab.com/ncz-os/knemon.git ../knemon
+    - git -C ../knemon checkout 3adbce5e4788353191ad9518c93889f9a6be2e06
+    - python -m pip install --quiet -e ../mnemos-core -e ../knemon -e ".[test]" pytest pytest-asyncio aiosqlite
   script:
-    - python -m pytest -q
+    - python -m pytest tests/ -q
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "push"'
