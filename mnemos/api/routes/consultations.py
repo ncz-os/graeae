@@ -358,6 +358,13 @@ async def _lock_quota_row_for_update(tx: Any, principal_key: str) -> None:
         # SQL via _mysql_lock_sql() so the identifier is backtick-
         # quoted on MySQL/MariaDB specifically.
         async with conn.cursor() as cursor:
+            # Create/lock the row before a gap-locking SELECT can deadlock
+            # competing first-use inserts. A duplicate is an unchanged row.
+            await cursor.execute(
+                "INSERT INTO state (`owner_id`, `namespace`, `key`, value) "
+                "VALUES (%s, %s, %s, '[]') ON DUPLICATE KEY UPDATE `key` = `key`",
+                (_QUOTA_OWNER_ID, _QUOTA_NAMESPACE, principal_key),
+            )
             await cursor.execute(
                 _mysql_lock_sql(),
                 (_QUOTA_OWNER_ID, _QUOTA_NAMESPACE, principal_key),

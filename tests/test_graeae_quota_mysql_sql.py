@@ -145,8 +145,9 @@ async def test_lock_quota_row_for_update_mysql_renders_backticked_sql(
 
     await consultations._lock_quota_row_for_update(tx, "principal-mysql")
 
-    assert len(executed) == 1, f"expected exactly 1 execute call, got {executed!r}"
-    sql, params = executed[0]
+    assert len(executed) == 2
+    assert "ON DUPLICATE KEY UPDATE" in executed[0][0]
+    sql, params = executed[1]
     assert "`key`" in sql, (
         f"MySQL execute must backtick-quote `key` — got: {sql!r}"
     )
@@ -196,10 +197,9 @@ async def test_lock_quota_row_for_update_mariadb_renders_backticked_sql(
 
     await consultations._lock_quota_row_for_update(tx, "principal-mariadb")
 
-    assert len(executed) == 1, (
-        f"MariaDB branch expected exactly 1 execute call, got {executed!r}"
-    )
-    sql, params = executed[0]
+    assert len(executed) == 2
+    assert "ON DUPLICATE KEY UPDATE" in executed[0][0]
+    sql, params = executed[1]
     assert "`key`" in sql, (
         f"MariaDB execute must backtick-quote `key` (also a reserved word "
         f"in MariaDB) — got: {sql!r}"

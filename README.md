@@ -124,8 +124,11 @@ all contradictions. `agreement_metric=lexical_complete_link` and
 `tests/test_quota_live.py` checks first-use admission from eight concurrent
 requests against an empty principal with a one-unit quota. It requires a
 dedicated test schema/database, `MNEMOS_TEST_ALLOW_RESET=1`, and either
-`MNEMOS_TEST_ORACLE_DSN` or `MNEMOS_TEST_DB2_DSN`; it deletes only its random quota
-key afterward. Oracle needs the `oracledb` driver and Db2 needs `ibm_db`.
+`MNEMOS_TEST_ORACLE_DSN`, `MNEMOS_TEST_DB2_DSN`, `MNEMOS_TEST_MYSQL_DSN`, or
+`MNEMOS_TEST_MARIADB_DSN`. Oracle/Db2 cleanup deletes only the random quota key;
+MySQL/MariaDB fixtures create and drop a randomly named database. Oracle needs the `oracledb` driver and Db2 needs `ibm_db`.
 The runtime creates the quota row before locking: Oracle does not gap-lock
 missing rows. Native Db2 uses positional binds and retains the update lock.
-Duplicate-key races alone are tolerated; database fetch failures deny admission.
+MySQL/MariaDB first-use deadlocks are avoided by an insert-or-no-op before the
+locking read. Duplicate-key races alone are tolerated; database fetch failures
+deny admission.
