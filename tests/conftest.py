@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -32,7 +31,16 @@ class _InMemoryStateRepository:
             return None
         return {"key": key, "value": value, "version": 1}
 
-    async def set(self, tx, key, value, *, owner_id="default", namespace="default", expires_at=None):
+    async def set(
+        self,
+        tx,
+        key,
+        value,
+        *,
+        owner_id="default",
+        namespace="default",
+        expires_at=None,
+    ):
         _ = expires_at
         self.rows[(owner_id, namespace, key)] = value
         return {"key": key, "value": value, "version": 2}
@@ -112,3 +120,15 @@ async def client(monkeypatch, mock_graeae_engine):
 
 
 __all__ = ["_InMemoryStateRepository", "_ConsultationsBackend"]
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_budget_defaults(monkeypatch):
+    """Gateway unit tests start uncapped; budget tests set explicit policy."""
+    monkeypatch.setenv("MNEMOS_KNEMON_WEEKLY_BUDGET_CAP_USD", "0")
+    monkeypatch.setenv("MNEMOS_KNEMON_PROVIDER_BUDGET_CAPS_USD", "")
+    from mnemos.core.config import get_settings
+
+    policy = get_settings().knemon
+    monkeypatch.setattr(policy, "weekly_budget_cap_usd", 0.0)
+    monkeypatch.setattr(policy, "provider_budget_caps_usd", "")

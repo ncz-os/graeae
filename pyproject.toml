@@ -11,8 +11,8 @@ license-files = ["LICENSE"]
 authors = [{ name = "MNEMOS Contributors" }]
 maintainers = [{ name = "Jason Perlow", email = "jperlow@gmail.com" }]
 readme = "README.md"
-requires-python = ">=3.11"
-dependencies = ["mnemos-core>=6.2,<7", "httpx"]
+requires-python = ">=3.13"
+dependencies = ["mnemos-core>=6.2,<7", "mnemos-knemon>=0.1,<1", "httpx"]
 
 [project.optional-dependencies]
 test = [
@@ -42,3 +42,5 @@ asyncio_mode = "auto"
 # than a silent registry fetch — uv does NOT fall back to the public
 # index for a `path` source.
 mnemos-core = { path = "../mnemos-core", editable = true }
+
+mnemos-knemon = { path = "../knemon", editable = true }

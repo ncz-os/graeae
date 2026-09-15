@@ -61,9 +61,10 @@ limits explicitly for trusted deployments.
 
 ## Relationship to the rest of MNEMOS
 
-GRAEAE depends on `mnemos-core` (one direction only). It pairs with
-`mnemos-pantheon` (the unified LLM facade GRAEAE calls through) and
-`mnemos-knemon` (which budgets GRAEAE consultations by cost tier). The
+GRAEAE depends on `mnemos-core` and `mnemos-knemon`. It calls provider adapters
+directly and uses KNEMON for per-attempt monetary admission and settlement.
+`mnemos-pantheon` is an optional facade that can call GRAEAE; GRAEAE does not
+route every provider call through PANTHEON. The
 fleet-wide agent coordination layer that *uses* GRAEAE is a separate service,
 **STIPHOS** (`mnemos-stiphos`).
 
@@ -87,3 +88,32 @@ supported by our open-source infrastructure partners:
   [Buildkite Open Source](https://buildkite.com/pricing) program.
 
 Thank you to both for backing open-source software.
+
+
+## Budget and agreement boundaries
+
+Python 3.13 or newer is required, matching the core distribution. Development
+installs need the real `../mnemos-core` and `../knemon` checkouts; fake resolver
+packages and import-time runtime substitutions are not supported.
+
+Every consultation participant and direct/streaming provider attempt reserves
+its own estimated cost before execution. The configured provider/model rate and
+bounded output allowance determine the reservation. A model override must have
+its own rates. When caps are configured, missing prices or persistence deny the
+attempt with an explicit error. Uncapped development can operate without a
+ledger; that mode does not provide durable spend enforcement. Budget scope is
+`graeae`; a PANTHEON request delegated here is accounted here once.
+
+Usage is normalized across OpenAI, Anthropic, and Gemini adapters. Stream
+completion, cancellation, and ambiguous transport failures finalize accounting;
+missing usage retains a conservative estimate. Unknown consultation cost stays
+null. KNEMON keeps estimated recovery costs after crashes and corrects them
+when an authoritative late settlement arrives.
+
+`consensus_score` is a lexical agreement heuristic, not a probability of
+correctness or a semantic contradiction detector. Quorum groups require every
+pair in the group to meet the threshold; similarity chains cannot create
+agreement between their endpoints. Matching templates with different numeric
+values and certain short negation pairs are rejected. These guards do not detect
+all contradictions. `agreement_metric=lexical_complete_link` and
+`contradiction_pairs` expose the method and observed guards.

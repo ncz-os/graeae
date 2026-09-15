@@ -40,13 +40,13 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from itertools import combinations
 from typing import Any, Dict, Optional
 
 import httpx
-
 from mnemos.core.config import get_settings
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.core.resilience import (
@@ -55,11 +55,9 @@ from mnemos.core.resilience import (
     make_concurrency_limiter,
     make_rate_limiter_pool,
 )
-from mnemos.domain.providers import _PROVIDER_ENV_VARS, get_key
-
-
 from mnemos.domain.graeae._cache import make_response_cache
 from mnemos.domain.graeae._quality import make_quality_tracker
+from mnemos.domain.graeae.accounting import price_provider_cost as price_provider_cost
 from mnemos.domain.graeae.elo_sync import load_cached_weights
 from mnemos.domain.graeae.provider_worker import (
     LocalProviderWorker,
@@ -67,6 +65,7 @@ from mnemos.domain.graeae.provider_worker import (
     ProviderQueryResponse,
     ProviderWorker,
 )
+from mnemos.domain.providers import _PROVIDER_ENV_VARS, get_key
 
 logger = logging.getLogger(__name__)
 
@@ -301,8 +300,8 @@ def _provider_scope(cfg: dict) -> str:
     if explicit in {"local", "external"}:
         return explicit
 
-    from urllib.parse import urlparse
     import ipaddress
+    from urllib.parse import urlparse
 
     host = (urlparse(str(cfg.get("url", ""))).hostname or "").lower()
     if not host:
@@ -1059,13 +1058,9 @@ class GraeaeEngine:
         # keep the per-call overhead bounded; KNEMON's per-plan window
         # is the authoritative gate.
         try:
-            anchor_provider = (
-                candidate_providers[0] if candidate_providers else None
-            )
+            anchor_provider = candidate_providers[0] if candidate_providers else None
             anchor_model = (
-                self.providers[anchor_provider]["model"]
-                if anchor_provider
-                else ""
+                self.providers[anchor_provider]["model"] if anchor_provider else ""
             )
             check = await enforce_provider_budget(
                 provider=anchor_provider or "unknown",
@@ -1286,7 +1281,9 @@ class GraeaeEngine:
                 try:
                     await call_maybe_async(self._quality.record_failure, name)
                 except Exception as exc:
-                    logger.error("[GRAEAE] quality failure record failed for %s: %s", name, exc)
+                    logger.error(
+                        "[GRAEAE] quality failure record failed for %s: %s", name, exc
+                    )
                 err_msg = f"{type(result).__name__}: {str(result)[:400]}"
                 logger.warning(f"[GRAEAE] muse {name} failed: {err_msg}")
                 return name, {
@@ -1314,7 +1311,9 @@ class GraeaeEngine:
                 try:
                     await call_maybe_async(self._quality.record_failure, name)
                 except Exception as exc:
-                    logger.error("[GRAEAE] quality failure record failed for %s: %s", name, exc)
+                    logger.error(
+                        "[GRAEAE] quality failure record failed for %s: %s", name, exc
+                    )
                 result["final_score"] = 0.0
                 return name, result
             await call_maybe_async(self._circuit_breakers.record_success, name)
@@ -1325,7 +1324,9 @@ class GraeaeEngine:
                     result.get("latency_ms", 0),
                 )
             except Exception as exc:
-                logger.error("[GRAEAE] quality success record failed for %s: %s", name, exc)
+                logger.error(
+                    "[GRAEAE] quality success record failed for %s: %s", name, exc
+                )
                 recorded_weight = self.providers[name].get("weight", 0.0)
             if recorded_weight is None:
                 try:
@@ -1334,7 +1335,9 @@ class GraeaeEngine:
                         name,
                     )
                 except Exception as exc:
-                    logger.error("[GRAEAE] quality weight read failed for %s: %s", name, exc)
+                    logger.error(
+                        "[GRAEAE] quality weight read failed for %s: %s", name, exc
+                    )
                     recorded_weight = self.providers[name].get("weight", 0.0)
             result["final_score"] = recorded_weight
             # ── F06: KNEMON spend ledger ─────────────────────────────────
@@ -1344,6 +1347,8 @@ class GraeaeEngine:
             # so this never raises out into the consensus rollup. The
             # outcome field feeds KNEMON's own quality multiplier.
             try:
+                if result.get("_accounted") and _spend_recorder is None:
+                    return name, result
                 spend = await record_provider_spend(
                     provider=name,
                     model=result.get("model_id", self.providers[name]["model"]),
@@ -1358,9 +1363,7 @@ class GraeaeEngine:
                 )
                 result["spend_record"] = spend.to_dict()
             except Exception as exc:  # last-resort safety net
-                logger.error(
-                    "[GRAEAE] spend record crashed for %s: %s", name, exc
-                )
+                logger.error("[GRAEAE] spend record crashed for %s: %s", name, exc)
             return name, result
 
         recorded_responses = await asyncio.gather(
@@ -1548,6 +1551,7 @@ class GraeaeEngine:
             **consensus,
             "quorum_reached": quorum_result["quorum_reached"],
             "quorum_threshold": quorum,
+            "agreement_metric": "lexical_complete_link",
             "similarity_pairs": quorum_result["similarity_pairs"],
             "contradiction_pairs": quorum_result["contradiction_pairs"],
         }
@@ -1772,7 +1776,9 @@ class GraeaeEngine:
             # Don't let a misconfigured budget checker take down the
             # gateway path — log + carry on, matching the
             # consult() tolerance.
-            logger.error("[GRAEAE] route(%s) budget gate raised unexpectedly: %s", provider, exc)
+            logger.error(
+                "[GRAEAE] route(%s) budget gate raised unexpectedly: %s", provider, exc
+            )
 
         concurrency = self._get_concurrency()
         if not await call_maybe_async(concurrency.acquire, provider):
@@ -1838,30 +1844,29 @@ class GraeaeEngine:
             # produces the same priced spend record as a consultation
             # fan-out. Failure here must NOT raise out into the gateway
             # response — degrade to log + continue.
-            try:
-                spend = await record_provider_spend(
-                    provider=provider,
-                    model=result.get("model_id", provider_config["model"]),
-                    task_type=str(task_type or "chat"),
-                    cost_usd=result.get("cost"),
-                    usage=result.get("usage"),
-                    latency_ms=int(result.get("latency_ms", 0) or 0),
-                    outcome=(
-                        "ok"
-                        if result.get("status") == "success"
-                        else str(result.get("status") or "err")
-                    ),
-                    tier=str(
-                        provider_config.get("tier", "standard") or "standard"
-                    ),
-                )
-                result["spend_record"] = spend.to_dict()
-            except Exception as exc:
-                logger.error(
-                    "[GRAEAE] spend record crashed in route(%s): %s",
-                    provider,
-                    exc,
-                )
+            if not result.get("_accounted") or _spend_recorder is not None:
+                try:
+                    spend = await record_provider_spend(
+                        provider=provider,
+                        model=result.get("model_id", provider_config["model"]),
+                        task_type=str(task_type or "chat"),
+                        cost_usd=result.get("cost"),
+                        usage=result.get("usage"),
+                        latency_ms=int(result.get("latency_ms", 0) or 0),
+                        outcome=(
+                            "ok"
+                            if result.get("status") == "success"
+                            else str(result.get("status") or "err")
+                        ),
+                        tier=str(provider_config.get("tier", "standard") or "standard"),
+                    )
+                    result["spend_record"] = spend.to_dict()
+                except Exception as exc:
+                    logger.error(
+                        "[GRAEAE] spend record crashed in route(%s): %s",
+                        provider,
+                        exc,
+                    )
             logger.debug(
                 f"[GRAEAE] route({provider}, {model or 'default'}) → {result['status']}"
             )
@@ -1956,15 +1961,18 @@ class GraeaeEngine:
                         )
 
                 if provider_cfg.get("api") == "openai":
-                    async for chunk in self._stream_openai_compatible(
-                        provider_cfg,
-                        prompt,
-                        timeout,
-                        generation_params=generation_params,
-                        request_params=request_params,
-                        messages=messages,
-                    ):
-                        yield chunk
+                    async with aclosing(
+                        self._stream_openai_compatible(
+                            provider_cfg,
+                            prompt,
+                            timeout,
+                            generation_params=generation_params,
+                            request_params=request_params,
+                            messages=messages,
+                        )
+                    ) as upstream:
+                        async for chunk in upstream:
+                            yield chunk
                 else:
                     result = await self._call_provider_worker(
                         provider,
@@ -2037,30 +2045,31 @@ class GraeaeEngine:
                 # — the stream path will fill it from the next
                 # client-prompt batch via the upstream ledger when
                 # the operator enables chunk-level accounting.
-                try:
-                    spend = await record_provider_spend(
-                        provider=provider,
-                        model=model or provider_config["model"],
-                        task_type=str(task_type or "stream"),
-                        cost_usd=None,
-                        usage=None,
-                        latency_ms=0,
-                        outcome="ok",
-                        tier=str(
-                            provider_config.get("tier", "standard") or "standard"
-                        ),
-                    )
-                    logger.debug(
-                        "[GRAEAE] stream spend recorded for %s status=%s",
-                        provider,
-                        spend.status,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "[GRAEAE] stream spend record crashed for %s: %s",
-                        provider,
-                        exc,
-                    )
+                if _spend_recorder is not None:
+                    try:
+                        spend = await record_provider_spend(
+                            provider=provider,
+                            model=model or provider_config["model"],
+                            task_type=str(task_type or "stream"),
+                            cost_usd=None,
+                            usage=None,
+                            latency_ms=0,
+                            outcome="ok",
+                            tier=str(
+                                provider_config.get("tier", "standard") or "standard"
+                            ),
+                        )
+                        logger.debug(
+                            "[GRAEAE] stream spend recorded for %s status=%s",
+                            provider,
+                            spend.status,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "[GRAEAE] stream spend record crashed for %s: %s",
+                            provider,
+                            exc,
+                        )
         finally:
             await call_maybe_async(concurrency.release, provider)
 
@@ -2077,21 +2086,43 @@ class GraeaeEngine:
     ) -> Dict:
         generation_params = _bounded_generation_params(generation_params)
         request_params = _bounded_request_params(request_params)
-        response = await self.provider_worker(
-            ProviderQueryRequest(
-                provider=provider_name,
-                model=model_override,
-                messages=messages,
-                params={
-                    "prompt": prompt,
-                    "task_type": task_type,
-                    "timeout": timeout,
-                    "generation_params": generation_params,
-                    "request_params": request_params,
-                },
-            )
+        from mnemos.domain.graeae.accounting import begin_attempt
+
+        config = self.providers[provider_name]
+        attempt = await begin_attempt(
+            provider_name,
+            config,
+            model_override or config["model"],
+            prompt,
+            generation_params,
+            request_params,
+            messages,
+            task_type,
+            timeout,
         )
-        return self._provider_worker_payload(response)
+        outcome = "err"
+        try:
+            response = await self.provider_worker(
+                ProviderQueryRequest(
+                    provider=provider_name,
+                    model=model_override,
+                    messages=messages,
+                    params={
+                        "prompt": prompt,
+                        "task_type": task_type,
+                        "timeout": timeout,
+                        "generation_params": generation_params,
+                        "request_params": request_params,
+                    },
+                )
+            )
+            result = self._provider_worker_payload(response)
+            attempt.observe(result)
+            outcome = "ok" if result.get("status") == "success" else "err"
+            result["_accounted"] = True
+            return result
+        finally:
+            await attempt.finish(outcome)
 
     # #189: removed `_query_provider` — thin pass-through wrapper
     # over `_call_provider_worker` with no callers. The 3 real
@@ -2208,18 +2239,7 @@ class GraeaeEngine:
         usage_block = data.get("usage")
         usage_dict: Optional[Dict[str, Any]]
         if isinstance(usage_block, dict):
-            usage_dict = {
-                k: usage_block.get(k)
-                for k in (
-                    "prompt_tokens",
-                    "completion_tokens",
-                    "total_tokens",
-                    "reasoning_tokens",
-                    "tokens_in",
-                    "tokens_out",
-                )
-                if k in usage_block
-            }
+            usage_dict = dict(usage_block)
         else:
             usage_dict = None
         return {
@@ -2258,46 +2278,76 @@ class GraeaeEngine:
             messages=messages,
             stream=True,
         )
-        client = await self._get_client()
-        async with client.stream(
-            "POST", provider["url"], json=payload, headers=headers, timeout=timeout
-        ) as resp:
-            if resp.status_code != 200:
-                body = await resp.aread()
-                raise RuntimeError(f"HTTP {resp.status_code}: {body[:200]!r}")
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                raw = line[5:].strip()
-                if not raw or raw == "[DONE]":
-                    break
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    logger.debug(
-                        "[GRAEAE] skipped non-JSON stream frame: %s", raw[:120]
-                    )
-                    continue
-                if isinstance(data, dict) and "error" in data:
-                    raise _provider_stream_error(data)
-                if not isinstance(data, dict):
-                    logger.debug(
-                        "[GRAEAE] skipped non-object stream frame: %s", raw[:120]
-                    )
-                    continue
-                for choice in data.get("choices", []):
-                    delta = choice.get("delta") or {}
-                    chunk = {"index": choice.get("index", 0)}
-                    if delta.get("role"):
-                        chunk["role"] = delta["role"]
-                    if delta.get("content") is not None:
-                        chunk["content"] = delta["content"]
-                    if delta.get("tool_calls"):
-                        chunk["tool_calls"] = delta["tool_calls"]
-                    if choice.get("finish_reason") is not None:
-                        chunk["finish_reason"] = choice["finish_reason"]
-                    if len(chunk) > 1:
-                        yield chunk
+        from mnemos.domain.graeae.accounting import begin_attempt
+
+        provider_name = next(
+            (
+                name
+                for name, cfg in self.providers.items()
+                if cfg.get("key_name") == provider.get("key_name")
+                and cfg.get("url") == provider.get("url")
+            ),
+            str(provider.get("name") or provider.get("api") or "openai"),
+        )
+        attempt = await begin_attempt(
+            provider_name,
+            provider,
+            provider["model"],
+            prompt,
+            generation_params,
+            request_params,
+            messages,
+            "stream",
+            timeout,
+        )
+        outcome = "err"
+        try:
+            client = await self._get_client()
+            async with client.stream(
+                "POST", provider["url"], json=payload, headers=headers, timeout=timeout
+            ) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    raise RuntimeError(f"HTTP {resp.status_code}: {body[:200]!r}")
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        logger.debug(
+                            "[GRAEAE] skipped non-JSON stream frame: %s", raw[:120]
+                        )
+                        continue
+                    if isinstance(data, dict) and "error" in data:
+                        raise _provider_stream_error(data)
+                    if not isinstance(data, dict):
+                        logger.debug(
+                            "[GRAEAE] skipped non-object stream frame: %s", raw[:120]
+                        )
+                        continue
+                    attempt.observe(data)
+                    if data.get("usage"):
+                        yield {"usage": data["usage"]}
+                    for choice in data.get("choices", []):
+                        delta = choice.get("delta") or {}
+                        chunk = {"index": choice.get("index", 0)}
+                        if delta.get("role"):
+                            chunk["role"] = delta["role"]
+                        if delta.get("content") is not None:
+                            chunk["content"] = delta["content"]
+                        if delta.get("tool_calls"):
+                            chunk["tool_calls"] = delta["tool_calls"]
+                        if choice.get("finish_reason") is not None:
+                            chunk["finish_reason"] = choice["finish_reason"]
+                        if len(chunk) > 1:
+                            yield chunk
+            outcome = "ok"
+        finally:
+            await attempt.finish(outcome)
 
     async def _query_anthropic(
         self,
@@ -2496,25 +2546,20 @@ class GraeaeEngine:
         gemini_usage = data.get("usageMetadata")
         usage_dict: Optional[Dict[str, Any]]
         if isinstance(gemini_usage, dict):
-            tokens_in = (
-                gemini_usage.get("promptTokenCount")
-                or gemini_usage.get("tokens_in")
+            tokens_in = gemini_usage.get("promptTokenCount") or gemini_usage.get(
+                "tokens_in"
             )
-            tokens_out = (
-                gemini_usage.get("candidatesTokenCount")
-                or gemini_usage.get("tokens_out")
+            tokens_out = gemini_usage.get("candidatesTokenCount") or gemini_usage.get(
+                "tokens_out"
             )
-            reasoning = (
-                gemini_usage.get("thoughtsTokenCount")
-                or gemini_usage.get("tokens_reasoning")
+            reasoning = gemini_usage.get("thoughtsTokenCount") or gemini_usage.get(
+                "tokens_reasoning"
             )
-            cached = (
-                gemini_usage.get("cachedContentTokenCount")
-                or gemini_usage.get("cache_read_input_tokens")
+            cached = gemini_usage.get("cachedContentTokenCount") or gemini_usage.get(
+                "cache_read_input_tokens"
             )
-            total = (
-                gemini_usage.get("totalTokenCount")
-                or gemini_usage.get("total_tokens")
+            total = gemini_usage.get("totalTokenCount") or gemini_usage.get(
+                "total_tokens"
             )
             usage_dict = {
                 k: v
@@ -2735,7 +2780,7 @@ def _debate_refinement_prompt(
     context = (
         "\n\n".join(others) if others else "No other round-1 responses were available."
     )
-    context = context[:_debate_peer_context_chars()]
+    context = context[: _debate_peer_context_chars()]
     return (
         "Original consultation prompt:\n"
         f"{prompt}\n\n"
@@ -2773,21 +2818,131 @@ def _text_similarity(left: str, right: str) -> float:
 # flag (e.g. "the cat is not here" vs "the cat is here" would still be
 # caught on "here", which IS a real content word, but "it is not X"
 # vs "it is X" would not be picked up on "it" / "is").
-_NEGATION_TOKENS = {"not", "n't", "never", "no", "without", "isnt", "arent", "wasnt", "werent", "dont", "doesnt", "didnt", "wont", "wouldnt", "couldnt", "shouldnt", "cant", "cannot"}
+_NEGATION_TOKENS = {
+    "not",
+    "n't",
+    "never",
+    "no",
+    "without",
+    "isnt",
+    "arent",
+    "wasnt",
+    "werent",
+    "dont",
+    "doesnt",
+    "didnt",
+    "wont",
+    "wouldnt",
+    "couldnt",
+    "shouldnt",
+    "cant",
+    "cannot",
+}
 _STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "if", "then", "else", "of",
-    "to", "in", "on", "at", "by", "for", "with", "as", "is", "are",
-    "was", "were", "be", "been", "being", "it", "its", "this", "that",
-    "these", "those", "i", "you", "he", "she", "we", "they", "me",
-    "him", "her", "us", "them", "my", "your", "his", "our", "their",
-    "do", "does", "did", "doing", "have", "has", "had", "having",
-    "so", "than", "too", "very", "can", "will", "would", "could",
-    "should", "may", "might", "must", "shall", "into", "from",
-    "about", "above", "below", "between", "after", "before",
-    "over", "under", "again", "further", "once", "here", "there",
-    "when", "where", "why", "how", "all", "any", "both", "each",
-    "few", "more", "most", "other", "some", "such", "no", "nor",
-    "not", "only", "own", "same", "also",
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "but",
+    "if",
+    "then",
+    "else",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "by",
+    "for",
+    "with",
+    "as",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "i",
+    "you",
+    "he",
+    "she",
+    "we",
+    "they",
+    "me",
+    "him",
+    "her",
+    "us",
+    "them",
+    "my",
+    "your",
+    "his",
+    "our",
+    "their",
+    "do",
+    "does",
+    "did",
+    "doing",
+    "have",
+    "has",
+    "had",
+    "having",
+    "so",
+    "than",
+    "too",
+    "very",
+    "can",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "must",
+    "shall",
+    "into",
+    "from",
+    "about",
+    "above",
+    "below",
+    "between",
+    "after",
+    "before",
+    "over",
+    "under",
+    "again",
+    "further",
+    "once",
+    "here",
+    "there",
+    "when",
+    "where",
+    "why",
+    "how",
+    "all",
+    "any",
+    "both",
+    "each",
+    "few",
+    "more",
+    "most",
+    "other",
+    "some",
+    "such",
+    "no",
+    "nor",
+    "not",
+    "only",
+    "own",
+    "same",
+    "also",
 }
 
 
@@ -2823,6 +2978,7 @@ def _detect_negation_contradiction(left: str, right: str) -> bool:
     # a real NLP contradiction pipeline, not this heuristic.
     if len(left_tokens) > 40 or len(right_tokens) > 40:
         return False
+
     # Split contractions the tokenizer left intact ("isn't" → "isn't" is
     # one token; we already enumerate the spelled-out forms in
     # _NEGATION_TOKENS but also strip the trailing apostrophe so
@@ -2866,6 +3022,20 @@ def _detect_negation_contradiction(left: str, right: str) -> bool:
     return bool(left_cues ^ right_cues)
 
 
+def _detect_numeric_contradiction(left: str, right: str) -> bool:
+    """Reject matching statement templates with different numeric literals."""
+    pattern = r"(?<![\w.])[+-]?\d+(?:[.,]\d+)*(?:%)?"
+    left_numbers = re.findall(pattern, left)
+    right_numbers = re.findall(pattern, right)
+    return bool(
+        left_numbers
+        and right_numbers
+        and left_numbers != right_numbers
+        and re.sub(pattern, "#", " ".join(left.lower().split()))
+        == re.sub(pattern, "#", " ".join(right.lower().split()))
+    )
+
+
 def _textual_agreement(left: str, right: str) -> float:
     """Composite score: textual similarity reduced when the texts contradict.
 
@@ -2879,7 +3049,9 @@ def _textual_agreement(left: str, right: str) -> float:
     silently inflate quorum_reached.
     """
     base = _text_similarity(left, right)
-    if _detect_negation_contradiction(left, right):
+    if _detect_negation_contradiction(left, right) or _detect_numeric_contradiction(
+        left, right
+    ):
         return min(base, 0.05)
     return base
 
@@ -2940,20 +3112,6 @@ def _compute_quorum(all_responses: Dict[str, Dict], quorum: float) -> Dict[str, 
             "contradiction_pairs": {},
         }
 
-    parent = {name: name for name in successes}
-
-    def find(name: str) -> str:
-        while parent[name] != name:
-            parent[name] = parent[parent[name]]
-            name = parent[name]
-        return name
-
-    def union(left: str, right: str) -> None:
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            parent[right_root] = left_root
-
     similarity_pairs: dict[str, float] = {}
     contradiction_pairs: dict[str, bool] = {}
     best_score = 0.0
@@ -2961,21 +3119,35 @@ def _compute_quorum(all_responses: Dict[str, Dict], quorum: float) -> Dict[str, 
         score = _textual_agreement(successes[left], successes[right])
         similarity_pairs[f"{left}:{right}"] = round(score, 4)
         best_score = max(best_score, score)
-        if score >= quorum:
-            union(left, right)
         # Surface the negation-contradiction flag for operator audit
         # regardless of whether the pair joined a quorum component.
-        if _detect_negation_contradiction(successes[left], successes[right]):
+        if _detect_negation_contradiction(
+            successes[left], successes[right]
+        ) or _detect_numeric_contradiction(successes[left], successes[right]):
             contradiction_pairs[f"{left}:{right}"] = True
             # Also flag in the reverse-key direction so a caller
             # looking up the pair by either ordering finds it.
             contradiction_pairs[f"{right}:{left}"] = True
 
-    components: dict[str, list[str]] = {}
-    for name in successes:
-        components.setdefault(find(name), []).append(name)
+    # Complete-link groups: every member must agree with every other.
+    # Transitive A~B~C does not establish A~C. Greedy grouping is bounded
+    # and conservative, rather than an exponential maximum-clique search.
+    components: list[list[str]] = []
+    for name in sorted(successes):
+        for group in components:
+            if all(
+                similarity_pairs.get(
+                    f"{name}:{other}", similarity_pairs.get(f"{other}:{name}", 0.0)
+                )
+                >= quorum
+                for other in group
+            ):
+                group.append(name)
+                break
+        else:
+            components.append([name])
     quorum_size = max(2, math.ceil(quorum * len(successes)))
-    quorum_muses = max(components.values(), key=len)
+    quorum_muses = max(components, key=len)
     quorum_reached = len(quorum_muses) >= quorum_size
 
     if quorum_reached and len(quorum_muses) > 1:
@@ -2985,11 +3157,12 @@ def _compute_quorum(all_responses: Dict[str, Dict], quorum: float) -> Dict[str, 
             )
             for left, right in combinations(quorum_muses, 2)
         ]
-        consensus_score = max(component_scores) if component_scores else best_score
+        consensus_score = min(component_scores) if component_scores else best_score
     else:
         consensus_score = min(best_score, max(0.0, quorum - 0.01))
 
     return {
+        "agreement_metric": "lexical_complete_link",
         "quorum_reached": quorum_reached,
         "quorum_muses": quorum_muses if quorum_reached else [],
         "consensus_score": round(float(consensus_score), 4),
@@ -3419,8 +3592,7 @@ class BudgetCheckResult:
     def raise_if_denied(self) -> None:
         if not self.allowed:
             raise ProviderBudgetExceeded(
-                self.reason
-                or f"provider {self.provider} budget exceeded",
+                self.reason or f"provider {self.provider} budget exceeded",
                 provider=self.provider,
                 model=self.model,
                 task_kind=self.task_kind,
@@ -3498,13 +3670,16 @@ def _resolve_spend_recorder():
                 error="mnemos.persistence.base unavailable",
             )
         try:
+            from mnemos.domain.knemon.attempts import normalized_usage
+            from mnemos.domain.knemon.budget import canonical_budget_key
+
+            usage = normalized_usage(record.usage)
+            canonical_provider, _ = canonical_budget_key(record.provider, record.model)
             ledger_record = _Rec(
-                provider=record.provider,
+                provider=canonical_provider,
                 model=record.model,
                 task_kind=record.task_kind,
-                tokens_in=int((record.usage or {}).get("prompt_tokens") or 0),
-                tokens_out=int((record.usage or {}).get("completion_tokens") or 0),
-                tokens_reasoning=int((record.usage or {}).get("reasoning_tokens") or 0),
+                **usage,
                 latency_ms=int(record.latency_ms or 0),
                 outcome=record.outcome,
                 caller_subsystem="graeae",
@@ -3525,9 +3700,7 @@ def _resolve_spend_recorder():
             backend_obj = _lc._persistence_backend
             assert backend_obj is not None
             async with backend_obj.transactional() as tx:
-                ledger_result = await backend_obj.record_usage_ledger(
-                    tx, ledger_record
-                )
+                ledger_result = await backend_obj.record_usage_ledger(tx, ledger_record)
             return SpendRecord(
                 status="ok",
                 provider=record.provider,
@@ -3580,15 +3753,28 @@ def _resolve_budget_checker():
     """
     if _budget_checker is not None:
         return _budget_checker
-    try:
-        # KNEMON ships ``mnemos.domain.knemon.router`` in its own
-        # distribution; importing here means GRAEAE remains
-        # installable without KNEMON. The probe failure path is
-        # the no-op checker below.
-        from mnemos.domain import knemon  # type: ignore[import-not-found]  # noqa: F401, WPS433
-    except Exception:
-        pass
-    return _permissive_budget_checker
+
+    async def check(provider, model, task_kind):
+        from mnemos.core import lifecycle
+        from mnemos.domain.knemon.budget import evaluate_usage_budget
+
+        decision = await evaluate_usage_budget(
+            lifecycle._persistence_backend, provider=provider, caller_subsystem="graeae"
+        )
+        return BudgetCheckResult(
+            allowed=decision.allowed,
+            provider=provider,
+            model=model,
+            task_kind=task_kind,
+            remaining_usd=(
+                decision.remaining_usd
+                if math.isfinite(decision.remaining_usd)
+                else None
+            ),
+            reason=decision.reason,
+        )
+
+    return check
 
 
 async def _permissive_budget_checker(
@@ -3728,45 +3914,6 @@ async def enforce_provider_budget(
     """
     checker = _resolve_budget_checker()
     return await checker(provider, model, task_type or "consultation")
-
-
-async def price_provider_cost(
-    *,
-    provider: str,
-    model: str,
-    usage: Optional[Dict[str, Any]],
-    declared_cost_usd: Optional[float] = None,
-) -> Optional[float]:
-    """Best-effort conversion of upstream usage into a priced USD cost.
-
-    Returns ``None`` when no pricing catalog is available, the
-    provider has no catalog entry, or the upstream usage block was
-    missing. Never returns ``0.0`` — that would be the F06 bug.
-    Returns ``declared_cost_usd`` unchanged when it is already a
-    real numeric value (priority 1: the upstream adapter knew the
-    cost; don't recompute).
-
-    The lookup falls back to ``mnemos.domain.pantheon.pricing``
-    if that subsystem is installed; otherwise it returns the
-    declared cost or None.
-    """
-    if isinstance(declared_cost_usd, (int, float)) and not isinstance(
-        declared_cost_usd, bool
-    ):
-        return float(declared_cost_usd)
-    if not isinstance(usage, dict) or not usage:
-        return None
-    try:
-        from mnemos.domain.pantheon.pricing import price_usage  # type: ignore[import-not-found]  # noqa: F401, WPS433
-    except Exception:
-        return None
-    try:
-        priced = price_usage(provider=provider, model=model, usage=usage)
-    except Exception:
-        return None
-    if isinstance(priced, (int, float)) and not isinstance(priced, bool):
-        return float(priced)
-    return None
 
 
 # ── Module-level singleton ─────────────────────────────────────────────────────
