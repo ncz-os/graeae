@@ -69,6 +69,10 @@ from mnemos.domain.providers import _PROVIDER_ENV_VARS, get_key
 
 logger = logging.getLogger(__name__)
 
+# Set once by _warn_registry_ranking_unavailable() so the registry-ranking
+# degradation is reported a single time per process rather than per consult.
+_registry_ranking_warned = False
+
 
 def _env_var_hint(key_name: str) -> str:
     """Return the env-var name an operator would export to bypass
@@ -583,6 +587,37 @@ def _ranked_lineup_ttl_seconds() -> int:
     return _positive_int_env(
         "MNEMOS_GRAEAE_RANKED_LINEUP_TTL_SECONDS",
         _DEFAULT_RANKED_LINEUP_TTL_SECONDS,
+    )
+
+
+def _warn_registry_ranking_unavailable() -> None:
+    """Log once when model_registry ranking cannot be reached on this backend.
+
+    mnemos.core.lifecycle._pool is populated only for the Postgres
+    profile; every other backend sets it to None. GRAEAE's registry
+    ranking therefore falls back to static config.toml weights with no
+    registry model_id override on Oracle, SQLite and Db2 -- all of which
+    do advertise the consultations capability and are actively populated by
+    GRAEAE's own backend-neutral provider sync. That degradation was
+    previously silent: the logger.debug on the surrounding except
+    only fires on an exception, never on this skipped branch.
+
+    Emitted once per process so a frozen muse lineup stays diagnosable
+    without logging on every consultation.
+    """
+    global _registry_ranking_warned
+    if _registry_ranking_warned:
+        return
+    _registry_ranking_warned = True
+
+    import mnemos.core.lifecycle as _lc
+
+    backend = getattr(_lc, '_persistence_backend', None)
+    logger.warning(
+        '[GRAEAE] model_registry ranking unavailable on %s: muse lineup is '
+        'using static config weights with no registry model_id override. '
+        'Registry ranking currently requires the Postgres backend.',
+        type(backend).__name__ if backend is not None else 'no configured backend',
     )
 
 
@@ -1635,6 +1670,8 @@ class GraeaeEngine:
                 for name, registry_model, weight in registry_ranked:
                     model_override = selection.get(name) if selection else None
                     ranked.append((name, model_override or registry_model, weight))
+            else:
+                _warn_registry_ranking_unavailable()
         except Exception as exc:
             logger.debug("[GRAEAE] model_registry ranking unavailable: %s", exc)
 
