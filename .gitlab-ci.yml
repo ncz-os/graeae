@@ -23,9 +23,9 @@ pytest:
   before_script:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends git build-essential cmake
     - git clone https://gitlab.com/ncz-os/mnemos.git ../mnemos-core
-    - git -C ../mnemos-core checkout 811a2bc2f33d80ca0c2ca9b6fd5696bd681d86b1
+    - git -C ../mnemos-core checkout 0ea31e2ec9a0d3418af764d245c31377f5fafdb0
     - git clone https://gitlab.com/ncz-os/knemon.git ../knemon
-    - git -C ../knemon checkout 3adbce5e4788353191ad9518c93889f9a6be2e06
+    - git -C ../knemon checkout 1304849d213c4085269b0cc73a36bdf7f5bd948d
     - python -m pip install --quiet -e ../mnemos-core -e ../knemon -e ".[test]" pytest pytest-asyncio aiosqlite
   script:
     - python -m pytest tests/ -q
