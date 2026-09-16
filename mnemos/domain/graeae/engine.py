@@ -3921,8 +3921,19 @@ async def enforce_provider_budget(
 _graeae_engine: Optional[GraeaeEngine] = None
 
 
+async def close_graeae_engine_if_loaded() -> None:
+    """Close only an existing singleton; shutdown must never construct one."""
+    if _graeae_engine is not None:
+        await _graeae_engine.close()
+
+
 def get_graeae_engine() -> GraeaeEngine:
     global _graeae_engine
     if _graeae_engine is None:
         _graeae_engine = GraeaeEngine()
+        # The resource owner registers cleanup. Core remains independent of
+        # optional domain modules, including in non-API lifecycle consumers.
+        from mnemos.core.lifecycle import register_lifespan_cleanup_hook
+
+        register_lifespan_cleanup_hook("graeae engine", close_graeae_engine_if_loaded)
     return _graeae_engine
