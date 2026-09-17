@@ -25,7 +25,7 @@ distribution (PEP 420) that overlays onto `mnemos-core`.
 pip install mnemos-core mnemos-graeae
 ```
 
-GRAEAE is bundled in the Mnemos umbrella image (`ghcr.io/ncz-os/mnemos`) and the
+GRAEAE is bundled in the Mnemos umbrella image (`ghcr.io/ncz-os/mnemos-enterprise`) and the
 `server`/`full` bundles, and is separable for minimal core installs. When the
 distribution is present, `mnemos-core` mounts the GRAEAE routes automatically;
 when absent, core boots without them.
@@ -73,6 +73,37 @@ fleet-wide agent coordination layer that *uses* GRAEAE is a separate service,
 > earlier monolithic `graeae_api.py` application has been refactored into this
 > packaged distribution plus the running GRAEAE service.
 
+
+## Backend coverage
+
+GRAEAE's consultation write path, its audit chain and its cost-weighted quota
+all run through core's persistence ABC and work on every backend core supports.
+
+**One path does not: `_ranked_lineup`'s `model_registry` ranking is
+PostgreSQL-only.** It reads `mnemos.core.lifecycle._pool`, which core populates
+only for the PostgreSQL profile and sets to `None` everywhere else. On SQLite,
+MySQL, MariaDB, Oracle and Db2 the registry ranking is therefore skipped
+entirely and the lineup falls back to the static `config.toml` weights with no
+registry `model_id` override — even though those backends advertise the
+`consultations` capability and GRAEAE's own backend-neutral provider sync is
+actively populating them.
+
+This is **not fixed**, and is not presented as fixed. It is now *diagnosable*
+rather than silent: the degradation logs one warning per process naming the
+active backend, where previously nothing was emitted at all (the surrounding
+`logger.debug` only fired on an exception, never on the skipped branch, so a
+frozen muse lineup was completely invisible). Reproducing the PostgreSQL
+semantics needs a `graeae_weight` value per candidate provider, and no method on
+`ConsultationsRepository` or `ConsultationAuditRepository` returns one —
+`graeae_weight` appears in core's `persistence/base.py` only as a write-side
+input to `update_arena_score`. A real fix needs a new abstract method in core
+plus six backend implementations, which is a core-owner decision.
+
+Separately, two raw-asyncpg, PostgreSQL-only audit writers
+(`_write_audit_entry_on_conn`, `_write_memory_refs_on_conn`) were removed. They
+had no callers anywhere — the live path has been
+`backend.consultations.create_consultation_with_audit` — and were left as a
+hazard for the next edit to reach for by mistake.
 
 ## Build infrastructure & partners
 
