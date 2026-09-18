@@ -5,7 +5,6 @@
 """
 
 import hashlib
-import hmac
 import inspect
 import json
 import logging
@@ -20,14 +19,6 @@ from mnemos.api.persistence_helpers import backend_or_503, require_consultations
 from mnemos.core import audit_chain
 from mnemos.core.rate_limit import limiter
 from mnemos.core.security import is_root, scope_namespace
-from mnemos.domain.graeae.consultation_support import (
-    _audit_hmac_key,
-    audit_genesis_hash,
-    compute_audit_chain_hash,
-    _to_graeae_provider,
-    _extract_memory_ids,
-    _require_non_empty_consultation_result,
-)
 from mnemos.domain.models import (
     SUPPORTED_CONSULTATION_MODES,
     AuditLogEntry,
@@ -35,6 +26,15 @@ from mnemos.domain.models import (
     ConsultationArtifact,
     ConsultationRequest,
     ConsultationResponse,
+)
+
+from mnemos.domain.graeae.consultation_support import (
+    _audit_hmac_key,
+    _extract_memory_ids,
+    _require_non_empty_consultation_result,
+    _to_graeae_provider,
+    audit_genesis_hash,
+    compute_audit_chain_hash,
 )
 
 logger = logging.getLogger(__name__)
@@ -607,6 +607,10 @@ async def consult_graeae(
         f"[CONSULTATION] {user.user_id}: {body.task_type} "
         f"(limit_chars={body.limit_chars}, format={body.format})"
     )
+    # Reject backends that cannot persist consultations before the quota path
+    # opens a transaction and commits usage to their otherwise-supported
+    # state_kv repository.
+    backend = require_consultations_backend()
     # SECURITY (review #12): cost-weighted per-principal quota, BEFORE any
     # provider fan-out, so a single caller cannot turn 60 req/min of
     # mode=all/debate into a financial DoS.
@@ -615,7 +619,6 @@ async def consult_graeae(
     # precomputed genesis is passed to persistence after the provider returns.
     genesis_hash = audit_genesis_hash()
     try:
-        backend = require_consultations_backend()
         from mnemos.domain.graeae.engine import get_graeae_engine
 
         engine = get_graeae_engine()

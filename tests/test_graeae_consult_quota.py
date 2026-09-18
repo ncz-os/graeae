@@ -27,6 +27,7 @@ from typing import Any, Self
 
 import pytest
 from mnemos.core import lifecycle
+from mnemos.persistence.base import STATE_CAPABILITY
 
 from mnemos.api.routes import consultations
 
@@ -355,6 +356,51 @@ async def test_zero_quota_disables_enforcement(monkeypatch: pytest.MonkeyPatch):
     # No state was written and no transactional() was opened.
     assert backend.state_kv.rows == {}
     assert backend.transaction_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_unsupported_backend_does_not_consume_quota(
+    client,
+    auth_headers: dict[str, str],
+    mock_graeae_engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A state-capable backend must fail before quota state is committed."""
+
+    state_kv = _InMemoryStateRepository()
+
+    class MysqlBackend:
+        supports_webhooks = False
+
+        def __init__(self) -> None:
+            self.capabilities = {STATE_CAPABILITY}
+            self.state_kv = state_kv
+            self.transaction_calls = 0
+
+        @asynccontextmanager
+        async def transactional(self):
+            self.transaction_calls += 1
+            yield SimpleNamespace(conn=None)
+
+    backend = MysqlBackend()
+    _patch_backend(monkeypatch, backend)
+    _patch_quota_env(monkeypatch, quota=20.0)
+    mock_graeae_engine.consult.reset_mock()
+
+    response = await client.post(
+        "/v1/consultations",
+        json={"prompt": "must fail without billing", "task_type": "reasoning"},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "persistence backend does not support 'consultations' for MysqlBackend"
+    )
+    assert backend.transaction_calls == 0
+    assert state_kv.rows == {}
+    assert state_kv.writes == []
+    mock_graeae_engine.consult.assert_not_awaited()
 
 
 @pytest.mark.asyncio
