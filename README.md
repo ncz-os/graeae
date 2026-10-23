@@ -79,25 +79,27 @@ fleet-wide agent coordination layer that *uses* GRAEAE is a separate service,
 GRAEAE's consultation write path, its audit chain and its cost-weighted quota
 all run through core's persistence ABC and work on every backend core supports.
 
-**One path does not: `_ranked_lineup`'s `model_registry` ranking is
-PostgreSQL-only.** It reads `mnemos.core.lifecycle._pool`, which core populates
-only for the PostgreSQL profile and sets to `None` everywhere else. On SQLite,
-MySQL, MariaDB, Oracle and Db2 the registry ranking is therefore skipped
-entirely and the lineup falls back to the static `config.toml` weights with no
-registry `model_id` override — even though those backends advertise the
-`consultations` capability and GRAEAE's own backend-neutral provider sync is
-actively populating them.
+**Registry-weighted lineup is backend-neutral.** `_ranked_lineup` reads
+`model_registry` through the backend-neutral
+`ConsultationAuditRepository.fetch_available_models` (inside a
+`backend.transactional()` scope) first, so registry `graeae_weight`
+ranking works on every persistence backend — Postgres, SQLite, MySQL,
+MariaDB, Oracle and Db2. On the PostgreSQL profile the legacy
+`mnemos.core.lifecycle._pool` projection (`provider = ANY($1::text[])`,
+`ORDER BY graeae_weight DESC NULLS LAST`) still runs as an enrichment and
+keeps the Postgres ordering byte-identical to the pool-only query.
 
-This is **not fixed**, and is not presented as fixed. It is now *diagnosable*
-rather than silent: the degradation logs one warning per process naming the
-active backend, where previously nothing was emitted at all (the surrounding
-`logger.debug` only fired on an exception, never on the skipped branch, so a
-frozen muse lineup was completely invisible). Reproducing the PostgreSQL
-semantics needs a `graeae_weight` value per candidate provider, and no method on
-`ConsultationsRepository` or `ConsultationAuditRepository` returns one —
-`graeae_weight` appears in core's `persistence/base.py` only as a write-side
-input to `update_arena_score`. A real fix needs a new abstract method in core
-plus six backend implementations, which is a core-owner decision.
+Backends whose neutral projection does not carry `graeae_weight`
+(only the guaranteed `provider`/`model_id`/`display_name` columns) still
+serve the lineup: candidates without a registry weight fall back to
+their static `config.toml` weight, and the lineup still reflects the
+registry's available/deprecated state.
+
+The degradation — no persistence backend at all, or the configured
+backend's `fetch_available_models` failing — is diagnosable: one warning
+per process (not per consultation) naming the active backend, and the
+lineup falls back to the static `config.toml` weights. Covered by
+`tests/test_graeae_f02_registry_lineup.py`.
 
 Separately, two raw-asyncpg, PostgreSQL-only audit writers
 (`_write_audit_entry_on_conn`, `_write_memory_refs_on_conn`) were removed. They
