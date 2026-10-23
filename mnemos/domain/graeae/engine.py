@@ -1689,17 +1689,35 @@ class GraeaeEngine:
             return {}
 
         ranked: list[tuple[str, Optional[str], float]] = []
-        cache_key = tuple(candidates)
+        # The cache key must identify the registry source, not just the
+        # candidate set: if the persistence backend or the Postgres pool is
+        # swapped at runtime (e.g. failover) a lineup cached from the old
+        # source must not be served.
+        import mnemos.core.lifecycle as _lc
+
+        source_id = (
+            type(getattr(_lc, "_persistence_backend", None)).__name__
+            if getattr(_lc, "_persistence_backend", None) is not None
+            else None,
+            "pool" if getattr(_lc, "_pool", None) is not None else None,
+        )
+        cache_key = (source_id, tuple(candidates))
         ranked_lineup_cache = getattr(self, "_ranked_lineup_cache", None)
         if ranked_lineup_cache is None:
             ranked_lineup_cache = _RankedLineupCache(_ranked_lineup_ttl_seconds())
             self._ranked_lineup_cache = ranked_lineup_cache
+        # Only the providers actually in this lineup need a registry ->
+        # GRAEAE name mapping; building the full map for every registered
+        # provider would carry entries that are always filtered out.
         registry_to_graeae = {
-            cfg["registry_provider"]: name for name, cfg in _REGISTRY_MAP.items()
+            _REGISTRY_MAP[name]["registry_provider"]: name
+            for name in candidates
+            if name in _REGISTRY_MAP
         }
 
         try:
-            import mnemos.core.lifecycle as _lc
+            backend = getattr(_lc, "_persistence_backend", None)
+            pool = getattr(_lc, "_pool", None)
 
             cached = ranked_lineup_cache.get(cache_key)
             if cached is not None:
@@ -1711,33 +1729,25 @@ class GraeaeEngine:
                     _REGISTRY_MAP.get(name, {}).get("registry_provider", name)
                     for name in candidates
                 ]
-                backend = getattr(_lc, "_persistence_backend", None)
-                pool = getattr(_lc, "_pool", None)
-                # Backend-neutral path first; the Postgres pool stays an
-                # optional enrichment, so the Postgres profile keeps the
-                # legacy projection (and ordering) exactly as before.
-                rows = (
-                    await _registry_rows_via_backend(backend)
-                    if backend is not None
-                    else None
-                )
-                if rows is None and backend is not None:
-                    # Backend configured but unable to serve the registry.
-                    _warn_registry_ranking_unavailable()
-                    rows = []
-                if rows is not None and pool is not None:
-                    rich_rows = await _registry_rows_via_pool(pool, registry_names)
-                    if rich_rows is not None:
-                        rows = rich_rows
-                if rows is None and pool is not None:
-                    # Pool-only (no backend) profile: the legacy query is
-                    # the registry source.
+                # Priority: on the Postgres profile the pool projection
+                # is the ranking source — it carries graeae_weight and
+                # the legacy "ORDER BY graeae_weight DESC NULLS LAST"
+                # ordering, keeping the Postgres lineup byte-identical to
+                # the pool-only query. On every other profile (no pool)
+                # the backend-neutral audit path serves the lineup from
+                # ConsultationAuditRepository.fetch_available_models. A
+                # None from a reader means that reader could not serve
+                # the registry; it is NOT the same as an empty registry
+                # (a genuine []), which is a valid cached state.
+                rows: list[Any] | None = None
+                if pool is not None:
                     rows = await _registry_rows_via_pool(pool, registry_names)
-                    if rows is None:
-                        _warn_registry_ranking_unavailable()
-                        rows = []
+                if rows is None and backend is not None:
+                    rows = await _registry_rows_via_backend(backend)
                 if rows is None:
-                    # Neither backend nor pool can serve the registry.
+                    # Neither reader could serve the registry: the lineup
+                    # degrades to the static config weights and the
+                    # operator-visible signal fires once per process.
                     _warn_registry_ranking_unavailable()
                     rows = []
                 seen: set[str] = set()

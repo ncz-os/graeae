@@ -68,6 +68,11 @@ class _NoAuditBackend:
     """Backend object that advertises no consultations_audit capability."""
 
 
+class _DistinctNameBackend(_FakeBackend):
+    """A backend with a distinct type name so the cache-key source
+    identity changes after a failover."""
+
+
 class _PoolConn:
     def __init__(self, rows: list, calls: list, exc: Exception | None = None):
         self._rows = rows
@@ -454,4 +459,142 @@ async def test_empty_registry_is_cached_not_refetched(monkeypatch):
 
     assert first_calls == 1
     assert second_calls == 1, "empty cached result was re-fetched"
-    assert counting._store.get(("openai", "claude")) == []
+    # The cache key now carries a backend/pool source identity, so assert
+    # the stored value by its (stable) candidate component rather than a
+    # hardcoded 2-tuple.
+    assert len(counting._store) == 1
+    (key,) = counting._store.keys()
+    candidates_component = key[-1]
+    assert set(candidates_component) == {"openai", "claude"}
+    assert counting._store[key] == []
+
+
+# ── backend failure must fall through to the pool (not cache empty) ────────
+
+
+async def test_backend_failure_falls_through_to_pool(monkeypatch, caplog):
+    """CRITICAL: a backend that cannot serve the registry (returns None /
+    raises) must NOT be cached as an empty registry and must NOT short-
+    circuit the Postgres pool enrichment. The pool then serves the lineup
+    and no warning is logged (the registry WAS reachable via the pool).
+
+    Fails before the fix: the backend-failure branch set rows=[] and
+    warned immediately, so `rows is not None` skipped the pool path and
+    an empty registry was cached."""
+    _reset_warn(monkeypatch)
+    pool = _FakePool(
+        rows=[
+            {"provider": "openai", "model_id": "gpt-5.5", "graeae_weight": 0.95},
+            {"provider": "anthropic", "model_id": "claude-opus-4-8", "graeae_weight": 0.40},
+        ]
+    )
+    # Backend raises -> _registry_rows_via_backend returns None.
+    monkeypatch.setattr(
+        lifecycle, "_persistence_backend", _FakeBackend(exc=RuntimeError("backend down"))
+    )
+    monkeypatch.setattr(lifecycle, "_pool", pool)
+    engine = _make_engine()
+    with caplog.at_level(logging.WARNING, logger="mnemos.domain.graeae.engine"):
+        lineup = await engine._ranked_lineup("reasoning", 2)
+    # The pool projection drove the lineup: openai (0.95) beats claude.
+    assert list(lineup) == ["openai", "claude"]
+    assert lineup["openai"] == "gpt-5.5"
+    # The pool was actually consulted.
+    assert len(pool.calls) == 1
+    # No warning: the registry was reachable via the pool.
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == []
+
+
+# ── warning fires only when BOTH backend and pool fail ──────────────────────
+
+
+async def test_warning_only_when_both_paths_fail(monkeypatch, caplog):
+    """HIGH: the operator-visible warning must fire only when both the
+    backend-neutral path and the pool enrichment are exhausted (both
+    returned None). A backend failure with a healthy pool must NOT warn.
+
+    Fails before the fix: the warning fired at the backend-failure branch
+    before the pool was even attempted."""
+    _reset_warn(monkeypatch)
+    # Backend raises (None) AND pool raises (None): both exhausted.
+    monkeypatch.setattr(
+        lifecycle, "_persistence_backend", _FakeBackend(exc=RuntimeError("backend down"))
+    )
+    monkeypatch.setattr(lifecycle, "_pool", _FakePool(exc=RuntimeError("pool down")))
+    engine = _make_engine()
+    with caplog.at_level(logging.WARNING, logger="mnemos.domain.graeae.engine"):
+        lineup1 = await engine._ranked_lineup("reasoning", 2)
+        engine._ranked_lineup_cache = _FakeRankedLineupCache()  # force re-read
+        lineup2 = await engine._ranked_lineup("reasoning", 2)
+    # Unweighted static fallback order.
+    assert list(lineup1) == ["claude", "openai"]
+    assert lineup1 == lineup2
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert _REGISTRY_UNAVAILABLE in warnings[0].getMessage()
+
+
+# ── cache key incorporates backend/pool identity (failover safety) ──────────
+
+
+async def test_cache_key_includes_source_identity(monkeypatch):
+    """MEDIUM: the cache key must incorporate the backend/pool identity so
+    a runtime failover (backend swapped) does not serve a lineup cached
+    from the old source. After swapping the backend, a fresh fetch occurs
+    (different key) rather than a stale hit."""
+    _reset_warn(monkeypatch)
+
+    class _CountingCache:
+        def __init__(self):
+            self._store = {}
+
+        def get(self, key):
+            return self._store.get(key)
+
+        def set(self, key, value):
+            self._store[key] = value
+
+    engine = object.__new__(GraeaeEngine)
+    engine.providers = {
+        "openai": {"model": "gpt-5.5", "weight": 0.50},
+        "claude": {"model": "claude-opus-4-8", "weight": 0.60},
+    }
+    counting = _CountingCache()
+    engine._ranked_lineup_cache = counting
+
+    backend_a = _FakeBackend(
+        rows=[
+            {"provider": "openai", "model_id": "gpt-5.5", "graeae_weight": 0.95},
+            {"provider": "anthropic", "model_id": "claude-opus-4-8"},
+        ]
+    )
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend_a)
+    await engine._ranked_lineup("reasoning", 2)
+    calls_after_a = backend_a.consultations_audit.calls
+    keys_after_a = set(counting._store.keys())
+    assert calls_after_a == 1
+    assert len(keys_after_a) == 1
+
+    # Failover: a differently-named backend type. The old cache entry must
+    # NOT be reused, so a fresh fetch happens under a new key.
+    backend_b = _DistinctNameBackend(
+        rows=[
+            {"provider": "openai", "model_id": "gpt-5.5", "graeae_weight": 0.10},
+            {"provider": "anthropic", "model_id": "claude-opus-4-8", "graeae_weight": 0.90},
+        ]
+    )
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend_b)
+    await engine._ranked_lineup("reasoning", 2)
+    calls_after_b = backend_b.consultations_audit.calls
+    assert calls_after_b == 1, "stale lineup from the old backend was served"
+    assert len(counting._store.keys()) == 2, "failover did not create a new cache entry"
+    # The two keys differ only in their source-identity component.
+    old_key = next(iter(keys_after_a))
+    new_keys = set(counting._store.keys()) - keys_after_a
+    (new_key,) = new_keys
+    assert old_key[-1] == new_key[-1], "candidate component must be unchanged"
+    assert old_key[0] != new_key[0], "source identity component must differ after failover"
+    # The new backend's weights (claude 0.90) now win.
+    lineup = await engine._ranked_lineup("reasoning", 2)
+    assert list(lineup) == ["claude", "openai"]
