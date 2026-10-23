@@ -1734,6 +1734,10 @@ class GraeaeEngine:
                     if rows is None:
                         _warn_registry_ranking_unavailable()
                         rows = []
+                if rows is None:
+                    # Neither backend nor pool can serve the registry.
+                    _warn_registry_ranking_unavailable()
+                    rows = []
                 seen: set[str] = set()
                 registry_ranked = []
                 for row in rows:
