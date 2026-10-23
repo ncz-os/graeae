@@ -1725,8 +1725,9 @@ class GraeaeEngine:
                     rows = []
                 if rows is not None and pool is not None:
                     rich_rows = await _registry_rows_via_pool(pool, registry_names)
-                    rows = rich_rows or rows
-                if rows is None:
+                    if rich_rows is not None:
+                        rows = rich_rows
+                if rows is None and pool is not None:
                     # Pool-only (no backend) profile: the legacy query is
                     # the registry source.
                     rows = await _registry_rows_via_pool(pool, registry_names)
