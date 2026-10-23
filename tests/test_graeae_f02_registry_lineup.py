@@ -414,3 +414,44 @@ async def test_selection_model_override_preserved(monkeypatch):
     assert list(lineup) == ["openai", "claude"]
     assert lineup["openai"] == "gpt-5.5-mini"
     assert lineup["claude"] == "claude-opus-4-8"
+
+
+# ── empty registry is a valid cached state, not a re-fetch trigger ──────────
+
+
+async def test_empty_registry_is_cached_not_refetched(monkeypatch):
+    """A backend that returns an empty registry list (no available rows)
+    is a valid cached state: the second call for the same key is a cache
+    hit, not a re-fetch. Fails before the fix: ``cache.get(...) or []``
+    treated the cached empty list as a miss and re-queried every time."""
+    _reset_warn(monkeypatch)
+    backend = _FakeBackend(rows=[])
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+
+    class _CountingCache:
+        def __init__(self):
+            self.fetches_via_backend = 0
+            self._store = {}
+
+        def get(self, key):
+            return self._store.get(key)
+
+        def set(self, key, value):
+            self._store[key] = value
+
+    counting = _CountingCache()
+    engine = object.__new__(GraeaeEngine)
+    engine.providers = {
+        "openai": {"model": "gpt-5.5", "weight": 0.50},
+        "claude": {"model": "claude-opus-4-8", "weight": 0.60},
+    }
+    engine._ranked_lineup_cache = counting
+
+    await engine._ranked_lineup("reasoning", 2)
+    first_calls = backend.consultations_audit.calls
+    await engine._ranked_lineup("reasoning", 2)
+    second_calls = backend.consultations_audit.calls
+
+    assert first_calls == 1
+    assert second_calls == 1, "empty cached result was re-fetched"
+    assert counting._store.get(("openai", "claude")) == []

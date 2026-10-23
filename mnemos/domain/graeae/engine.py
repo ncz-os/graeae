@@ -1701,10 +1701,12 @@ class GraeaeEngine:
         try:
             import mnemos.core.lifecycle as _lc
 
-            registry_ranked: list[tuple[str, Optional[str], float]] = (
-                ranked_lineup_cache.get(cache_key) or []
-            )
-            if not registry_ranked:
+            cached = ranked_lineup_cache.get(cache_key)
+            if cached is not None:
+                registry_ranked: list[tuple[str, Optional[str], float]] = cached
+            else:
+                registry_ranked = None
+            if registry_ranked is None:
                 registry_names = [
                     _REGISTRY_MAP.get(name, {}).get("registry_provider", name)
                     for name in candidates
