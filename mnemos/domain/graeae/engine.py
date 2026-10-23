@@ -1701,28 +1701,34 @@ class GraeaeEngine:
         try:
             import mnemos.core.lifecycle as _lc
 
-            registry_ranked = ranked_lineup_cache.get(cache_key)
-            if registry_ranked is None:
+            registry_ranked: list[tuple[str, Optional[str], float]] = (
+                ranked_lineup_cache.get(cache_key) or []
+            )
+            if not registry_ranked:
                 registry_names = [
                     _REGISTRY_MAP.get(name, {}).get("registry_provider", name)
                     for name in candidates
                 ]
                 backend = getattr(_lc, "_persistence_backend", None)
                 pool = getattr(_lc, "_pool", None)
-                if backend is not None:
-                    rows = await _registry_rows_via_backend(backend)
-                    if rows is None:
-                        _warn_registry_ranking_unavailable()
-                        rows = []
-                    elif pool is not None:
-                        # Postgres profile: the legacy projection keeps the
-                        # ranking byte-identical to the pool-only query.
-                        rich_rows = await _registry_rows_via_pool(pool, registry_names)
-                        rows = rich_rows or rows
-                elif pool is None:
+                # Backend-neutral path first; the Postgres pool stays an
+                # optional enrichment, so the Postgres profile keeps the
+                # legacy projection (and ordering) exactly as before.
+                rows = (
+                    await _registry_rows_via_backend(backend)
+                    if backend is not None
+                    else None
+                )
+                if rows is None and backend is not None:
+                    # Backend configured but unable to serve the registry.
                     _warn_registry_ranking_unavailable()
                     rows = []
-                else:
+                if rows is not None and pool is not None:
+                    rich_rows = await _registry_rows_via_pool(pool, registry_names)
+                    rows = rich_rows or rows
+                if rows is None:
+                    # Pool-only (no backend) profile: the legacy query is
+                    # the registry source.
                     rows = await _registry_rows_via_pool(pool, registry_names)
                     if rows is None:
                         _warn_registry_ranking_unavailable()
