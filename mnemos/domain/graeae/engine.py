@@ -583,6 +583,72 @@ def _max_candidates() -> int:
     return _positive_int_env("MNEMOS_GRAEAE_MAX_CANDIDATES", _DEFAULT_MAX_CANDIDATES)
 
 
+async def _registry_rows_via_backend(backend: Any) -> list[Any] | None:
+    """Fetch model_registry rows through the backend-neutral audit repository.
+
+    Every persistence backend implements
+    ``ConsultationAuditRepository.fetch_available_models`` inside a
+    ``backend.transactional()`` scope. Postgres, SQLite and MySQL return
+    ``provider``/``model_id``/``display_name`` ordered by ``graeae_weight``
+    DESC NULLS LAST; Oracle returns the richer projection (which includes
+    ``graeae_weight``) and Db2 returns the guaranteed baseline columns
+    only.
+
+    Returns ``None`` — not ``[]`` — when the backend cannot serve the
+    registry at all (no ``consultations_audit`` repository, no
+    ``transactional()``, or the call raised), so the caller can
+    distinguish "backend incapable / failing" from "backend queried
+    successfully and the registry is genuinely empty".
+    """
+    consultations_audit = getattr(backend, "consultations_audit", None)
+    transactional = getattr(backend, "transactional", None)
+    if consultations_audit is None or not callable(transactional):
+        logger.debug(
+            "[GRAEAE] persistence backend %s exposes no consultations_audit capability",
+            type(backend).__name__,
+        )
+        return None
+    try:
+        async with transactional() as tx:
+            rows = await consultations_audit.fetch_available_models(tx)
+        return list(rows) if rows is not None else []
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "[GRAEAE] model_registry ranking unavailable via %s.consultations_audit: %s",
+            type(backend).__name__,
+            exc,
+        )
+        return None
+
+
+async def _registry_rows_via_pool(pool: Any, registry_names: list[str]) -> list[Any] | None:
+    """Fetch the legacy Postgres projection from an asyncpg-compatible pool.
+
+    This is the exact query shape (and ordering) the lineup ranking has
+    always used on the Postgres profile: one parameterised ``$1::text[]``
+    lookup, ``graeae_weight DESC NULLS LAST``. A pool failure returns
+    ``None`` so the caller can fall back to the neutral rows.
+    """
+    try:
+        async with pool.acquire() as conn:
+            return list(
+                await conn.fetch(
+                    """
+                    SELECT provider, model_id, graeae_weight
+                    FROM model_registry
+                    WHERE provider = ANY($1::text[])
+                      AND available = true
+                      AND deprecated = false
+                    ORDER BY graeae_weight DESC NULLS LAST
+                    """,
+                    registry_names,
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[GRAEAE] model_registry ranking unavailable via pool: %s", exc)
+        return None
+
+
 def _ranked_lineup_ttl_seconds() -> int:
     return _positive_int_env(
         "MNEMOS_GRAEAE_RANKED_LINEUP_TTL_SECONDS",
@@ -591,19 +657,16 @@ def _ranked_lineup_ttl_seconds() -> int:
 
 
 def _warn_registry_ranking_unavailable() -> None:
-    """Log once when model_registry ranking cannot be reached on this backend.
+    """Log once when model_registry ranking cannot be reached at all.
 
-    mnemos.core.lifecycle._pool is populated only for the Postgres
-    profile; every other backend sets it to None. GRAEAE's registry
-    ranking therefore falls back to static config.toml weights with no
-    registry model_id override on Oracle, SQLite and Db2 -- all of which
-    do advertise the consultations capability and are actively populated by
-    GRAEAE's own backend-neutral provider sync. That degradation was
-    previously silent: the logger.debug on the surrounding except
-    only fires on an exception, never on this skipped branch.
-
-    Emitted once per process so a frozen muse lineup stays diagnosable
-    without logging on every consultation.
+    Fired only when *neither* the backend-neutral
+    ``consultations_audit.fetch_available_models`` path *nor* the legacy
+    ``mnemos.core.lifecycle._pool`` (Postgres profile) can serve the
+    ranking — no persistence backend configured at all, or the configured
+    backend's call failed/is missing. The lineup still answers from the
+    static config.toml weights in that case, so the degradation must be
+    diagnosable without logging on every consultation: emitted once per
+    process.
     """
     global _registry_ranking_warned
     if _registry_ranking_warned:
@@ -616,7 +679,10 @@ def _warn_registry_ranking_unavailable() -> None:
     logger.warning(
         '[GRAEAE] model_registry ranking unavailable on %s: muse lineup is '
         'using static config weights with no registry model_id override. '
-        'Registry ranking currently requires the Postgres backend.',
+        'Every persistence backend serves model_registry rows through '
+        'ConsultationAuditRepository.fetch_available_models(); a missing '
+        'reading means no persistence backend is configured or its '
+        'model_registry is unreachable.',
         type(backend).__name__ if backend is not None else 'no configured backend',
     )
 
@@ -1597,7 +1663,20 @@ class GraeaeEngine:
         limit: int,
         selection: Optional[Dict[str, Optional[str]]] = None,
     ) -> Dict[str, Optional[str]]:
-        """Pick the highest-weighted providers, preferring model_registry weights."""
+        """Pick the highest-weighted providers, preferring model_registry weights.
+
+        Backend-neutral first (F-02): every persistence backend serves
+        model_registry rows through
+        ConsultationAuditRepository.fetch_available_models inside a
+        backend.transactional() scope, so registry weighting no longer
+        depends on the Postgres-only mnemos.core.lifecycle._pool. The
+        Postgres pool remains as the optional enrichment that preserves
+        the legacy query shape (provider filter + graeae_weight DESC
+        NULLS LAST ordering) byte-for-byte when the active profile is
+        Postgres. When neither path can read the registry, the lineup
+        falls back to the static config.toml weights and one
+        operator-visible warning is logged per process.
+        """
         del task_type  # model_registry stores graeae_weight globally today.
         candidates = [
             name
@@ -1610,68 +1689,95 @@ class GraeaeEngine:
             return {}
 
         ranked: list[tuple[str, Optional[str], float]] = []
-        cache_key = tuple(candidates)
+        # The cache key must identify the registry source, not just the
+        # candidate set: if the persistence backend or the Postgres pool is
+        # swapped at runtime (e.g. failover) a lineup cached from the old
+        # source must not be served.
+        import mnemos.core.lifecycle as _lc
+
+        source_id = (
+            type(getattr(_lc, "_persistence_backend", None)).__name__
+            if getattr(_lc, "_persistence_backend", None) is not None
+            else None,
+            "pool" if getattr(_lc, "_pool", None) is not None else None,
+        )
+        cache_key = (source_id, tuple(candidates))
         ranked_lineup_cache = getattr(self, "_ranked_lineup_cache", None)
         if ranked_lineup_cache is None:
             ranked_lineup_cache = _RankedLineupCache(_ranked_lineup_ttl_seconds())
             self._ranked_lineup_cache = ranked_lineup_cache
+        # Only the providers actually in this lineup need a registry ->
+        # GRAEAE name mapping; building the full map for every registered
+        # provider would carry entries that are always filtered out.
+        registry_to_graeae = {
+            _REGISTRY_MAP[name]["registry_provider"]: name
+            for name in candidates
+            if name in _REGISTRY_MAP
+        }
 
         try:
-            import mnemos.core.lifecycle as _lc
+            backend = getattr(_lc, "_persistence_backend", None)
+            pool = getattr(_lc, "_pool", None)
 
-            if _lc._pool:
-                registry_ranked = ranked_lineup_cache.get(cache_key)
-                if registry_ranked is None:
-                    registry_names = [
-                        _REGISTRY_MAP.get(name, {}).get("registry_provider", name)
-                        for name in candidates
-                    ]
-                    registry_to_graeae = {
-                        cfg["registry_provider"]: name
-                        for name, cfg in _REGISTRY_MAP.items()
-                    }
-                    async with _lc._pool.acquire() as conn:
-                        rows = await conn.fetch(
-                            """
-                            SELECT provider, model_id, graeae_weight
-                            FROM model_registry
-                            WHERE provider = ANY($1::text[])
-                              AND available = true
-                              AND deprecated = false
-                            ORDER BY graeae_weight DESC NULLS LAST
-                            """,
-                            registry_names,
-                        )
-                    seen: set[str] = set()
-                    registry_ranked = []
-                    for row in rows:
-                        registry_provider = _row_get(row, "provider")
-                        name = registry_to_graeae.get(
-                            registry_provider, registry_provider
-                        )
-                        if name not in candidates or name in seen:
-                            continue
-                        registry_ranked.append(
-                            (
-                                name,
-                                _row_get(row, "model_id"),
-                                float(
-                                    _row_get(
-                                        row,
-                                        "graeae_weight",
-                                        self.providers[name].get("weight", 0.0),
-                                    )
-                                    or 0.0
-                                ),
-                            )
-                        )
-                        seen.add(name)
-                    ranked_lineup_cache.set(cache_key, registry_ranked)
-                for name, registry_model, weight in registry_ranked:
-                    model_override = selection.get(name) if selection else None
-                    ranked.append((name, model_override or registry_model, weight))
+            cached = ranked_lineup_cache.get(cache_key)
+            if cached is not None:
+                registry_ranked: list[tuple[str, Optional[str], float]] = cached
             else:
-                _warn_registry_ranking_unavailable()
+                registry_ranked = None
+            if registry_ranked is None:
+                registry_names = [
+                    _REGISTRY_MAP.get(name, {}).get("registry_provider", name)
+                    for name in candidates
+                ]
+                # Priority: on the Postgres profile the pool projection
+                # is the ranking source — it carries graeae_weight and
+                # the legacy "ORDER BY graeae_weight DESC NULLS LAST"
+                # ordering, keeping the Postgres lineup byte-identical to
+                # the pool-only query. On every other profile (no pool)
+                # the backend-neutral audit path serves the lineup from
+                # ConsultationAuditRepository.fetch_available_models. A
+                # None from a reader means that reader could not serve
+                # the registry; it is NOT the same as an empty registry
+                # (a genuine []), which is a valid cached state.
+                rows: list[Any] | None = None
+                if pool is not None:
+                    rows = await _registry_rows_via_pool(pool, registry_names)
+                if rows is None and backend is not None:
+                    rows = await _registry_rows_via_backend(backend)
+                if rows is None:
+                    # Neither reader could serve the registry: the lineup
+                    # degrades to the static config weights and the
+                    # operator-visible signal fires once per process.
+                    _warn_registry_ranking_unavailable()
+                    rows = []
+                seen: set[str] = set()
+                registry_ranked = []
+                for row in rows:
+                    registry_provider = _row_get(row, "provider")
+                    name = registry_to_graeae.get(
+                        registry_provider, registry_provider
+                    )
+                    if name not in candidates or name in seen:
+                        continue
+                    registry_ranked.append(
+                        (
+                            name,
+                            _row_get(row, "model_id"),
+                            float(
+                                _row_get(
+                                    row,
+                                    "graeae_weight",
+                                    self.providers[name].get("weight", 0.0),
+                                )
+                                or 0.0
+                            ),
+                        )
+                    )
+                    seen.add(name)
+                ranked_lineup_cache.set(cache_key, registry_ranked)
+            for name, registry_model, weight in registry_ranked:
+                model_override = selection.get(name) if selection else None
+                ranked.append((name, model_override or registry_model, weight))
         except Exception as exc:
             logger.debug("[GRAEAE] model_registry ranking unavailable: %s", exc)
 
